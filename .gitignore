@@ -1,0 +1,14 @@
+build/
+host/.* 
+host/*.o
+host/*.ko
+host/*.mod
+host/*.mod.c
+host/Module.symvers
+host/modules.order
+tests/afalg_test
+tools/bbcrypt
+tools/board_aes
+demos/6_hash
+board/bbcryptod
+__pycache__/
