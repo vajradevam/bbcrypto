@@ -346,3 +346,394 @@ static void bbc_out_complete(struct urb *u)
 		bbc_kick(d, &d->done_work);
 	bbc_cmd_put(c); /* the urb's reference */
 }
+
+/* (re)transmit a command; consumes one reference on success or failure */
+static int bbc_send(struct bbc_dev *d, struct bbc_cmd *c)
+{
+	int ret;
+
+	usb_fill_bulk_urb(c->urb, d->udev, d->pipe_out, c->obuf, c->olen, bbc_out_complete, c);
+	usb_anchor_urb(c->urb, &d->anchor);
+	ret = usb_submit_urb(c->urb, GFP_NOIO);
+	if (ret) {
+		unsigned long fl;
+		bool fin;
+
+		usb_unanchor_urb(c->urb);
+		spin_lock_irqsave(&d->lock, fl);
+		fin = bbc_finish_locked(d, c, ret);
+		spin_unlock_irqrestore(&d->lock, fl);
+		if (fin)
+			bbc_kick(d, &d->done_work);
+		bbc_cmd_put(c);
+	}
+	return ret;
+}
+
+static void bbc_send_queued(struct bbc_dev *d)
+{
+	for (;;) {
+		struct bbc_cmd *c;
+		unsigned long fl;
+
+		spin_lock_irqsave(&d->lock, fl);
+		if (d->dead || d->n_inflight >= win() || list_empty(&d->queue)) {
+			spin_unlock_irqrestore(&d->lock, fl);
+			return;
+		}
+		c = list_first_entry(&d->queue, struct bbc_cmd, node);
+		list_move_tail(&c->node, &d->inflight);
+		c->state = CMD_INFLIGHT;
+		c->waiting = false;
+		c->attempts = 1;
+		c->sent = jiffies;
+		d->n_queued--;
+		if (++d->n_inflight > d->max_inflight)
+			d->max_inflight = d->n_inflight;
+		kref_get(&c->ref); /* for the urb */
+		/* arm the retransmission timer; checked under the lock so a disconnect wins */
+		kref_get(&d->ref);
+		if (!queue_delayed_work(bbc_wq, &d->to_work, BBC_TICK))
+			bbc_put(d);
+		spin_unlock_irqrestore(&d->lock, fl);
+		bbc_send(d, c);
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* reply path                                                          */
+/* ------------------------------------------------------------------ */
+
+static void bbc_rx_complete(struct urb *u)
+{
+	struct bbc_dev *d = u->context;
+	struct bbc_resp *rs = (struct bbc_resp *)d->rx_buf;
+	unsigned long fl;
+	bool fin = false;
+	int ret;
+
+	switch (u->status) {
+	case 0:
+		d->rx_errs = 0;
+		break;
+	case -ENOENT:
+	case -ECONNRESET:
+	case -ESHUTDOWN:
+		return; /* urb killed */
+	default:
+		if (++d->rx_errs > 20) {
+			dev_err(&d->intf->dev, "reply pipe failing (%d), giving up\n", u->status);
+			return;
+		}
+		goto resubmit;
+	}
+
+	if (u->actual_length >= sizeof(*rs) && le32_to_cpu(rs->magic) == BBC_MAGIC) {
+		u32 tag = le32_to_cpu(rs->tag);
+		struct bbc_cmd *c;
+
+		spin_lock_irqsave(&d->lock, fl);
+		list_for_each_entry(c, &d->inflight, node)
+		{
+			u64 need;
+			int st = 0;
+
+			if (c->tag != tag)
+				continue;
+			need = (u64)sizeof(*rs) + le32_to_cpu(rs->ivlen) + le32_to_cpu(rs->datalen);
+			if (need > u->actual_length)
+				st = -EPROTO;
+			else if (u->actual_length > c->rcap)
+				st = -EMSGSIZE;
+			else {
+				memcpy(c->rbuf, rs, u->actual_length);
+				c->rlen = u->actual_length;
+			}
+			fin = bbc_finish_locked(d, c, st);
+			break;
+		}
+		spin_unlock_irqrestore(&d->lock, fl);
+		if (fin)
+			bbc_kick(d, &d->done_work);
+		/* no match: a duplicate (the board replayed a reply we already had) - ignore */
+	}
+resubmit:
+	if (READ_ONCE(d->dead))
+		return;
+	usb_anchor_urb(u, &d->anchor);
+	ret = usb_submit_urb(u, GFP_ATOMIC);
+	if (ret) {
+		usb_unanchor_urb(u);
+		dev_err(&d->intf->dev, "cannot repost reply urb: %d\n", ret);
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* cipher requests (declared early: the workers drive them)            */
+/* ------------------------------------------------------------------ */
+
+struct bbc_creq {
+	struct list_head node; /* in d->active */
+	struct skcipher_request *req;
+	struct bbc_dev *d;
+	u32 total, off, inflight;
+	int err;
+	bool dec, serial;
+	u32 alg;
+	unsigned int ivsize;
+	u8 iv[AES_BLOCK_SIZE]; /* IV for the next chunk to emit; the final IV at the end */
+};
+
+static void bbc_creq_emit(struct bbc_creq *cr);
+static void bbc_creq_progress(struct bbc_creq *cr);
+
+static void bbc_emit_chunks(struct bbc_dev *d)
+{
+	for (;;) {
+		struct bbc_creq *cr = NULL, *it;
+		unsigned long fl;
+
+		spin_lock_irqsave(&d->lock, fl);
+		if (d->dead || d->n_inflight + d->n_queued >= win()) {
+			spin_unlock_irqrestore(&d->lock, fl);
+			return;
+		}
+		list_for_each_entry(it, &d->active, node)
+		{
+			if (it->err || it->off >= it->total)
+				continue;
+			if (it->inflight >= (it->serial ? 1 : win()))
+				continue;
+			cr = it;
+			break;
+		}
+		if (cr)
+			list_move_tail(&cr->node, &d->active); /* round-robin between requests */
+		spin_unlock_irqrestore(&d->lock, fl);
+		if (!cr)
+			return;
+		bbc_creq_emit(cr);
+	}
+}
+
+static void bbc_pump_work(struct work_struct *w)
+{
+	struct bbc_dev *d = container_of(w, struct bbc_dev, pump_work);
+
+	bbc_emit_chunks(d);
+	bbc_send_queued(d);
+	bbc_put(d);
+}
+
+static void bbc_done_work(struct work_struct *w)
+{
+	struct bbc_dev *d = container_of(w, struct bbc_dev, done_work);
+	struct bbc_cmd *c, *tmp;
+	LIST_HEAD(l);
+	unsigned long fl;
+
+	for (;;) {
+		spin_lock_irqsave(&d->lock, fl);
+		list_splice_init(&d->donelist, &l);
+		spin_unlock_irqrestore(&d->lock, fl);
+		if (list_empty(&l))
+			break;
+		list_for_each_entry_safe(c, tmp, &l, node)
+		{
+			list_del_init(&c->node);
+			if (c->status) {
+				atomic64_inc(&d->n_err);
+			} else {
+				atomic64_inc(&d->n_req);
+				atomic64_add(c->bytes, &d->n_bytes);
+			}
+			atomic64_add(ktime_us_delta(ktime_get(), c->t0), &d->n_lat_us);
+			c->done(c);
+			bbc_cmd_put(c); /* the engine's reference */
+		}
+	}
+	bbc_emit_chunks(d); /* window slots just freed */
+	bbc_send_queued(d);
+	bbc_put(d);
+}
+
+/* retransmit commands whose reply is overdue */
+static void bbc_to_work(struct work_struct *w)
+{
+	struct bbc_dev *d = container_of(to_delayed_work(w), struct bbc_dev, to_work);
+	struct bbc_cmd *c, *tmp;
+	LIST_HEAD(resend);
+	unsigned long fl;
+	bool fin = false;
+
+	spin_lock_irqsave(&d->lock, fl);
+	list_for_each_entry_safe(c, tmp, &d->inflight, node)
+	{
+		if (!c->waiting ||
+		    !time_after(jiffies, c->sent + msecs_to_jiffies(BBC_RX_TIMEOUT_MS)))
+			continue;
+		if (c->attempts >= BBC_RETRIES) {
+			dev_err(&d->intf->dev, "tag %u: no reply after %u attempts\n", c->tag,
+				c->attempts);
+			fin |= bbc_finish_locked(d, c, -ETIMEDOUT);
+			continue;
+		}
+		c->attempts++;
+		c->waiting = false;
+		c->sent = jiffies;
+		atomic64_inc(&d->n_retry);
+		kref_get(&c->ref);
+		list_add_tail(&c->rnode, &resend);
+	}
+	if (!d->dead && !list_empty(&d->inflight)) {
+		kref_get(&d->ref);
+		if (!queue_delayed_work(bbc_wq, &d->to_work, BBC_TICK))
+			bbc_put(d);
+	}
+	spin_unlock_irqrestore(&d->lock, fl);
+
+	list_for_each_entry_safe(c, tmp, &resend, rnode)
+	{
+		list_del_init(&c->rnode);
+		dev_dbg(&d->intf->dev, "resending tag %u (attempt %u)\n", c->tag, c->attempts);
+		bbc_send(d, c);
+	}
+	if (fin)
+		bbc_kick(d, &d->done_work);
+	bbc_put(d);
+}
+
+/* disconnect: fail everything that is still pending (runs on the ordered workqueue) */
+static void bbc_fail_work(struct work_struct *w)
+{
+	struct bbc_dev *d = container_of(w, struct bbc_dev, fail_work);
+	struct bbc_creq *cr, *tmp;
+	struct bbc_cmd *c, *ctmp;
+	LIST_HEAD(act);
+	unsigned long fl;
+
+	spin_lock_irqsave(&d->lock, fl);
+	list_for_each_entry_safe(c, ctmp, &d->queue, node)
+	{
+		c->state = CMD_DONE;
+		c->status = -ENODEV;
+		list_move_tail(&c->node, &d->donelist);
+	}
+	d->n_queued = 0;
+	list_for_each_entry_safe(c, ctmp, &d->inflight, node)
+	{
+		c->state = CMD_DONE;
+		c->status = -ENODEV;
+		list_move_tail(&c->node, &d->donelist);
+	}
+	d->n_inflight = 0;
+	spin_unlock_irqrestore(&d->lock, fl);
+
+	kref_get(&d->ref);	      /* bbc_done_work() consumes one reference */
+	bbc_done_work(&d->done_work); /* completes the failed chunks */
+
+	spin_lock_irqsave(&d->lock, fl);
+	list_splice_init(&d->active, &act);
+	spin_unlock_irqrestore(&d->lock, fl);
+	list_for_each_entry_safe(cr, tmp, &act, node)
+	{
+		cr->err = -ENODEV;
+		bbc_creq_progress(cr);
+	}
+	bbc_put(d);
+}
+
+/* ------------------------------------------------------------------ */
+/* synchronous round trip (used by the hashes and by probe)            */
+/* ------------------------------------------------------------------ */
+
+struct bbc_out {
+	u32 id;
+	u8 *iv;
+	u32 ivcap, ivlen;
+	u8 *data;
+	u32 datacap, datalen;
+};
+
+static void bbc_sync_done(struct bbc_cmd *c)
+{
+	complete(&c->comp);
+}
+
+static int bbc_xfer(struct bbc_dev *d, u16 op, u16 flags, u32 id, u32 alg, const void *key,
+		    u32 keylen, const void *iv, u32 ivlen, const void *data, u32 datalen,
+		    struct bbc_out *out)
+{
+	struct bbc_cmd *c;
+	struct bbc_resp *rs;
+	u32 rcap, ilen, dlen;
+	u8 *dp, *p;
+	int ret;
+
+	if (keylen > BBC_MAX_KEY || ivlen > BBC_MAX_IV || datalen > BBC_MAX_DATA)
+		return -EINVAL;
+	rcap = sizeof(*rs) + BBC_MAX_IV + max_t(u32, out ? out->datacap : 0, 64);
+	c = bbc_cmd_new(d, op, flags, id, alg, key, keylen, iv, ivlen, datalen, rcap, &dp);
+	if (!c)
+		return -ENOMEM;
+	if (datalen)
+		memcpy(dp, data, datalen);
+	init_completion(&c->comp);
+	kref_get(&c->ref); /* ours; the engine's is dropped after ->done() */
+	bbc_cmd_submit(c, bbc_sync_done, NULL);
+	wait_for_completion(&c->comp);
+
+	ret = c->status;
+	if (ret)
+		goto out;
+	rs = (struct bbc_resp *)c->rbuf;
+	ilen = le32_to_cpu(rs->ivlen);
+	dlen = le32_to_cpu(rs->datalen);
+	ret = (s32)le32_to_cpu(rs->status);
+	if (ret)
+		goto out;
+	p = c->rbuf + sizeof(*rs);
+	if (out) {
+		out->id = le32_to_cpu(rs->id);
+		if (out->iv) {
+			out->ivlen = min(ilen, out->ivcap);
+			memcpy(out->iv, p, out->ivlen);
+		}
+		if (out->data) {
+			if (dlen > out->datacap) {
+				ret = -EMSGSIZE;
+				goto out;
+			}
+			out->datalen = dlen;
+			memcpy(out->data, p + ilen, dlen);
+		}
+	}
+out:
+	bbc_cmd_put(c);
+	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* hashes                                                              */
+/* ------------------------------------------------------------------ */
+
+struct bbc_hash_ctx { /* per tfm */
+	u8 key[BBC_MAX_KEY];
+	u32 keylen;
+};
+
+struct bbc_hash_desc { /* per request; id 0 = no board session yet */
+	u32 id;
+	u32 devid; /* the board that holds the session */
+};
+
+struct bbc_shash {
+	struct shash_alg alg;
+	u32 id; /* enum bbc_alg */
+	bool registered;
+};
+
+static struct bbc_shash *to_bshash(struct crypto_shash *tfm)
+{
+	return container_of(crypto_shash_alg(tfm), struct bbc_shash, alg);
+}
