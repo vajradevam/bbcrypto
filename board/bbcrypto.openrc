@@ -1,0 +1,60 @@
+#!/sbin/openrc-run
+# OpenRC service for the BeagleBone side of bbcrypto: adds a FunctionFS interface to the
+# existing USB gadget (created by the "usbgadget" service) and runs bbcryptod on it.
+# Install on the board:  cp bbcrypto.openrc /etc/init.d/bbcrypto; chmod +x /etc/init.d/bbcrypto
+#                        rc-update add bbcrypto default
+description="bbcrypto USB crypto accelerator (FunctionFS + bbcryptod)"
+command=/usr/local/bin/bbcryptod
+pidfile=/run/bbcryptod.pid
+G=/sys/kernel/config/usb_gadget/g1
+F=$G/functions/ffs.bbc
+MNT=/dev/ffs-bbc
+LOG=/var/log/bbcryptod.log
+
+# Runs right after the gadget exists and before the network/ssh come up, so the short USB
+# re-enumeration caused by adding the interface happens before anybody is connected.
+depend() { need usbgadget localmount; before networking sshd; }
+
+udc() { ls /sys/class/udc | head -n1; }
+
+# Never kill the daemon while the gadget is bound: it hung this board's kernel twice.
+unbind() { echo "" > $G/UDC 2>/dev/null; sleep 1; }
+
+start() {
+    ebegin "Starting bbcrypto"
+    modprobe usb_f_fs 2>/dev/null
+    [ -d $G ] || { eend 1 "usb gadget not created"; return 1; }
+    UDC=$(udc); [ -n "$UDC" ] || { eend 1 "no UDC"; return 1; }
+    unbind
+    kill -9 $(pgrep bbcryptod) 2>/dev/null     # leftover daemon from a manual start (gadget is unbound)
+    mountpoint -q $MNT && umount $MNT
+    rm -f $G/configs/c.1/ffs.bbc
+    [ -d $F ] || mkdir $F || { echo "$UDC" > $G/UDC; eend 1; return 1; }
+    ln -s $F $G/configs/c.1/ffs.bbc
+    mkdir -p $MNT
+    if ! mount -t functionfs bbc $MNT; then
+        rm -f $G/configs/c.1/ffs.bbc; echo "$UDC" > $G/UDC; eend 1 "functionfs mount failed"; return 1
+    fi
+    start-stop-daemon --start --background --make-pidfile --pidfile $pidfile \
+        --stdout $LOG --stderr $LOG --exec $command -- $MNT
+    sleep 1
+    if ! echo "$UDC" > $G/UDC; then
+        # fall back to serial+ethernet only, so the board stays reachable
+        unbind
+        start-stop-daemon --stop --pidfile $pidfile
+        umount $MNT; rm -f $G/configs/c.1/ffs.bbc
+        echo "$UDC" > $G/UDC
+        eend 1 "UDC bind failed, running without bbcrypto"; return 1
+    fi
+    eend 0
+}
+
+stop() {
+    ebegin "Stopping bbcrypto"
+    unbind                                  # first take the USB side away ...
+    start-stop-daemon --stop --pidfile $pidfile --retry 3   # ... then stop the daemon
+    mountpoint -q $MNT && umount $MNT
+    rm -f $G/configs/c.1/ffs.bbc
+    UDC=$(udc); [ -n "$UDC" ] && echo "$UDC" > $G/UDC   # serial + ethernet come back
+    eend 0
+}

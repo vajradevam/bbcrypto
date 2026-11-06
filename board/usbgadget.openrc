@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+description="USB gadget: serial console (ACM) + Ethernet (ECM) via configfs"
+depend() { before networking sshd; need localmount; }
+start() {
+    modprobe libcomposite 2>/dev/null
+    mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+    G=/sys/kernel/config/usb_gadget/g1
+    [ -d $G ] && return 0
+    mkdir -p $G && cd $G || return 1
+    echo 0x1d6b > idVendor; echo 0x0104 > idProduct; echo 0x0200 > bcdUSB
+    mkdir -p strings/0x409
+    echo "$(cat /proc/device-tree/serial-number 2>/dev/null | tr -d '\0')" > strings/0x409/serialnumber
+    echo "Beagle" > strings/0x409/manufacturer
+    echo "BeagleBone Black" > strings/0x409/product
+    mkdir -p configs/c.1/strings/0x409
+    echo "ACM+ECM" > configs/c.1/strings/0x409/configuration
+    mkdir -p functions/acm.usb0 functions/ecm.usb0
+    echo e8:eb:11:45:da:92 > functions/ecm.usb0/host_addr
+    echo e8:eb:11:45:da:91 > functions/ecm.usb0/dev_addr
+    ln -s functions/acm.usb0 configs/c.1/
+    ln -s functions/ecm.usb0 configs/c.1/
+    UDC=$(ls /sys/class/udc | head -n1)
+    # With the bbcrypto service installed it adds its FunctionFS function and binds the
+    # UDC itself; binding here too would make the host enumerate the board twice.
+    [ -e /etc/runlevels/default/bbcrypto ] && return 0
+    [ -n "$UDC" ] && echo "$UDC" > UDC
+    return 0
+}
+stop() { [ -d /sys/kernel/config/usb_gadget/g1 ] && echo "" > /sys/kernel/config/usb_gadget/g1/UDC; return 0; }
