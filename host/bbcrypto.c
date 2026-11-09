@@ -737,3 +737,261 @@ static struct bbc_shash *to_bshash(struct crypto_shash *tfm)
 {
 	return container_of(crypto_shash_alg(tfm), struct bbc_shash, alg);
 }
+
+static int bbc_hash_setkey(struct crypto_shash *tfm, const u8 *key, unsigned int len)
+{
+	struct bbc_hash_ctx *c = crypto_shash_ctx(tfm);
+
+	if (len > BBC_MAX_KEY)
+		return -EINVAL;
+	memcpy(c->key, key, len);
+	c->keylen = len;
+	return 0;
+}
+
+static int bbc_hash_init(struct shash_desc *desc)
+{
+	struct bbc_hash_desc *dd = shash_desc_ctx(desc);
+
+	dd->id = 0; /* session is created lazily */
+	dd->devid = 0;
+	return 0;
+}
+
+/* the board for this request: the one holding its session, else any */
+static struct bbc_dev *bbc_hash_dev(struct bbc_hash_desc *dd)
+{
+	return dd->id ? bbc_get_id(dd->devid) : bbc_get();
+}
+
+static int bbc_hash_new(struct bbc_dev *d, struct shash_desc *desc)
+{
+	struct bbc_hash_desc *dd = shash_desc_ctx(desc);
+	struct bbc_hash_ctx *c = crypto_shash_ctx(desc->tfm);
+	struct bbc_out out = {};
+	int ret;
+
+	ret = bbc_xfer(d, BBC_OP_HASH_NEW, 0, 0, to_bshash(desc->tfm)->id, c->key, c->keylen, NULL,
+		       0, NULL, 0, &out);
+	if (!ret) {
+		dd->id = out.id;
+		dd->devid = d->devid;
+	}
+	return ret;
+}
+
+static int bbc_hash_update_dev(struct bbc_dev *d, struct shash_desc *desc, const u8 *data,
+			       unsigned int len)
+{
+	struct bbc_hash_desc *dd = shash_desc_ctx(desc);
+	int ret;
+
+	if (!dd->id) {
+		ret = bbc_hash_new(d, desc);
+		if (ret)
+			return ret;
+	}
+	while (len) {
+		unsigned int n = min_t(unsigned int, len, BBC_MAX_DATA);
+
+		ret = bbc_xfer(d, BBC_OP_HASH_UPDATE, 0, dd->id, 0, NULL, 0, NULL, 0, data, n,
+			       NULL);
+		if (ret)
+			return ret;
+		data += n;
+		len -= n;
+	}
+	return 0;
+}
+
+static int bbc_hash_update(struct shash_desc *desc, const u8 *data, unsigned int len)
+{
+	struct bbc_dev *d = bbc_hash_dev(shash_desc_ctx(desc));
+	int ret;
+
+	if (!d)
+		return -ENODEV;
+	ret = bbc_hash_update_dev(d, desc, data, len);
+	bbc_put(d);
+	return ret;
+}
+
+static int bbc_hash_final_dev(struct bbc_dev *d, struct shash_desc *desc, const u8 *data,
+			      unsigned int len, u8 *out)
+{
+	struct bbc_hash_desc *dd = shash_desc_ctx(desc);
+	struct bbc_hash_ctx *c = crypto_shash_ctx(desc->tfm);
+	struct bbc_out o = {.data = out, .datacap = crypto_shash_digestsize(desc->tfm)};
+	int ret;
+
+	if (!dd->id && len <= BBC_MAX_DATA) /* whole message in one round trip */
+		return bbc_xfer(d, BBC_OP_HASH_NEW, BBC_F_ONESHOT, 0, to_bshash(desc->tfm)->id,
+				c->key, c->keylen, NULL, 0, data, len, &o);
+	ret = bbc_hash_update_dev(d, desc, data, len);
+	if (ret)
+		return ret;
+	ret = bbc_xfer(d, BBC_OP_HASH_FINAL, 0, dd->id, 0, NULL, 0, NULL, 0, NULL, 0, &o);
+	dd->id = 0; /* board frees the session on FINAL */
+	return ret;
+}
+
+static int bbc_hash_finup(struct shash_desc *desc, const u8 *data, unsigned int len, u8 *out)
+{
+	struct bbc_dev *d = bbc_hash_dev(shash_desc_ctx(desc));
+	int ret;
+
+	if (!d)
+		return -ENODEV;
+	ret = bbc_hash_final_dev(d, desc, data, len, out);
+	bbc_put(d);
+	return ret;
+}
+
+static int bbc_hash_final(struct shash_desc *desc, u8 *out)
+{
+	return bbc_hash_finup(desc, NULL, 0, out);
+}
+
+static int bbc_hash_digest(struct shash_desc *desc, const u8 *data, unsigned int len, u8 *out)
+{
+	bbc_hash_init(desc);
+	return bbc_hash_finup(desc, data, len, out);
+}
+
+/* export/import: the state lives on the board; export clones the session */
+static int bbc_hash_export(struct shash_desc *desc, void *out)
+{
+	struct bbc_hash_desc *dd = shash_desc_ctx(desc);
+	struct bbc_dev *d;
+	struct bbc_out o = {};
+	u32 id = 0, devid = 0;
+	int ret = 0;
+
+	if (dd->id) {
+		d = bbc_get_id(dd->devid);
+		if (!d)
+			return -ENODEV;
+		ret = bbc_xfer(d, BBC_OP_HASH_CLONE, 0, dd->id, 0, NULL, 0, NULL, 0, NULL, 0, &o);
+		devid = d->devid;
+		bbc_put(d);
+		if (ret)
+			return ret;
+		id = o.id;
+	}
+	put_unaligned_le32(id, out);
+	put_unaligned_le32(devid, out + 4);
+	return 0;
+}
+
+static int bbc_hash_import(struct shash_desc *desc, const void *in)
+{
+	struct bbc_hash_desc *dd = shash_desc_ctx(desc);
+
+	dd->id = get_unaligned_le32(in);
+	dd->devid = get_unaligned_le32(in + 4);
+	return 0;
+}
+
+#define BBC_HASH(_alg, _name, _drv, _dsz, _bsz, _hmac)                                             \
+	{                                                                                          \
+		.id = _alg,                                                                        \
+		.alg = {.init = bbc_hash_init,                                                     \
+			.update = bbc_hash_update,                                                 \
+			.final = bbc_hash_final,                                                   \
+			.finup = bbc_hash_finup,                                                   \
+			.digest = bbc_hash_digest,                                                 \
+			.export = bbc_hash_export,                                                 \
+			.import = bbc_hash_import,                                                 \
+			.setkey = (_hmac) ? bbc_hash_setkey : NULL,                                \
+			.descsize = sizeof(struct bbc_hash_desc),                                  \
+			.digestsize = _dsz,                                                        \
+			.statesize = 2 * sizeof(u32),                                              \
+			.base = {.cra_name = _name,                                                \
+				 .cra_driver_name = _drv,                                          \
+				 .cra_blocksize = _bsz,                                            \
+				 .cra_ctxsize = sizeof(struct bbc_hash_ctx),                       \
+				 .cra_module = THIS_MODULE} }                                      \
+	}
+
+static struct bbc_shash bbc_hashes[] = {
+	BBC_HASH(BBC_ALG_SHA1, "sha1", "sha1-bbcrypto", SHA1_DIGEST_SIZE, SHA1_BLOCK_SIZE, false),
+	BBC_HASH(BBC_ALG_SHA256, "sha256", "sha256-bbcrypto", SHA256_DIGEST_SIZE, SHA256_BLOCK_SIZE,
+		 false),
+	BBC_HASH(BBC_ALG_HMAC_SHA256, "hmac(sha256)", "hmac-sha256-bbcrypto", SHA256_DIGEST_SIZE,
+		 SHA256_BLOCK_SIZE, true),
+};
+
+/* ------------------------------------------------------------------ */
+/* AES modes (asynchronous)                                            */
+/* ------------------------------------------------------------------ */
+
+struct bbc_skcipher {
+	struct skcipher_alg alg;
+	u32 id;
+	bool registered;
+};
+
+struct bbc_cipher_ctx {
+	u8 key[AES_MAX_KEY_SIZE];
+	u32 keylen;
+};
+
+static struct bbc_skcipher *to_bsk(struct crypto_skcipher *tfm)
+{
+	return container_of(crypto_skcipher_alg(tfm), struct bbc_skcipher, alg);
+}
+
+static int bbc_cipher_init(struct crypto_skcipher *tfm)
+{
+	crypto_skcipher_set_reqsize(tfm, sizeof(struct bbc_creq));
+	return 0;
+}
+
+static int bbc_cipher_setkey(struct crypto_skcipher *tfm, const u8 *key, unsigned int len)
+{
+	struct bbc_cipher_ctx *c = crypto_skcipher_ctx(tfm);
+
+	if (len != AES_KEYSIZE_128 && len != AES_KEYSIZE_192 && len != AES_KEYSIZE_256)
+		return -EINVAL;
+	memcpy(c->key, key, len);
+	c->keylen = len;
+	return 0;
+}
+
+/* advance a 128-bit big-endian counter by 'blocks' */
+static void bbc_ctr_add(u8 *iv, u64 blocks)
+{
+	int i;
+	unsigned int carry;
+
+	for (i = 15; i >= 0 && blocks; i--) {
+		carry = iv[i] + (blocks & 0xff);
+		iv[i] = carry & 0xff;
+		blocks = (blocks >> 8) + (carry >> 8);
+	}
+	for (; i >= 0 && blocks; i--)
+		if (++iv[i])
+			break;
+}
+
+/* all runs on the ordered workqueue */
+static void bbc_creq_progress(struct bbc_creq *cr)
+{
+	struct skcipher_request *req = cr->req;
+	struct bbc_dev *d = cr->d;
+	unsigned long fl;
+	int err;
+
+	if (cr->inflight || (!cr->err && cr->off < cr->total))
+		return;
+	spin_lock_irqsave(&d->lock, fl);
+	if (!list_empty(&cr->node))
+		list_del_init(&cr->node);
+	spin_unlock_irqrestore(&d->lock, fl);
+
+	err = cr->err;
+	if (!err && cr->ivsize)
+		memcpy(req->iv, cr->iv, cr->ivsize);
+	bbc_put(d);
+	skcipher_request_complete(req, err); /* req (and cr) may be gone after this */
+}
