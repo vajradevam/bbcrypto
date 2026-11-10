@@ -277,3 +277,273 @@ static void ctr_add(uint8_t *iv, uint64_t blocks)
 			break;
 	}
 }
+
+static void do_cipher(const struct bbc_req *rq, const uint8_t *key, uint32_t keylen,
+		      const uint8_t *iv, uint32_t ivlen, const uint8_t *data, uint32_t datalen,
+		      struct reply *r, uint8_t *scratch)
+{
+	uint32_t alg = le32toh(rq->alg);
+	const char *nm = cipher_name(alg);
+	int dec = le16toh(rq->flags) & BBC_F_DECRYPT;
+	int tfm, fd;
+	uint32_t op = dec ? ALG_OP_DECRYPT : ALG_OP_ENCRYPT;
+	char cbuf[CMSG_SPACE(sizeof(op)) + CMSG_SPACE(sizeof(struct af_alg_iv) + BBC_MAX_IV)] = {0};
+	struct iovec iov = {(void *)data, datalen};
+	struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf};
+	struct cmsghdr *c;
+	size_t cl;
+
+	if (!nm) {
+		r->status = -EOPNOTSUPP;
+		return;
+	}
+	fd = alg_open("skcipher", nm, key, keylen, &tfm, 0);
+	if (fd < 0) {
+		r->status = fd;
+		return;
+	}
+	close(tfm);
+
+	cl = CMSG_SPACE(sizeof(op));
+	c = CMSG_FIRSTHDR(&msg);
+	c->cmsg_level = SOL_ALG;
+	c->cmsg_type = ALG_SET_OP;
+	c->cmsg_len = CMSG_LEN(sizeof(op));
+	memcpy(CMSG_DATA(c), &op, sizeof(op));
+	if (ivlen) {
+		struct af_alg_iv *ai;
+		c = (struct cmsghdr *)(cbuf + cl);
+		c->cmsg_level = SOL_ALG;
+		c->cmsg_type = ALG_SET_IV;
+		c->cmsg_len = CMSG_LEN(sizeof(*ai) + ivlen);
+		ai = (struct af_alg_iv *)CMSG_DATA(c);
+		ai->ivlen = ivlen;
+		memcpy(ai->iv, iv, ivlen);
+		cl += CMSG_SPACE(sizeof(*ai) + ivlen);
+	}
+	msg.msg_controllen = cl;
+
+	if (sendmsg(fd, &msg, 0) < 0) {
+		r->status = -errno;
+		close(fd);
+		return;
+	}
+	r->status = read_full(fd, scratch, datalen);
+	close(fd);
+	if (r->status)
+		return;
+	r->data = scratch;
+	r->datalen = datalen;
+
+	if (ivlen == 16) { /* hand back the chained IV */
+		memcpy(r->iv, iv, 16);
+		r->ivlen = 16;
+		if (alg == BBC_ALG_CBC_AES && datalen >= 16)
+			memcpy(r->iv, (dec ? data : scratch) + datalen - 16, 16);
+		else if (alg == BBC_ALG_CTR_AES)
+			ctr_add(r->iv, (datalen + 15) / 16);
+	}
+}
+
+/*
+ * gcm(aes). The board kernel is built without AF_ALG AEAD support, so gcm-aes-omap cannot be
+ * reached from user space. GCM is therefore assembled here: the AES work runs on the hardware
+ * engine through ctr(aes)/ecb(aes), and only GHASH (a multiplication in GF(2^128)) is done in
+ * software with a 4-bit table.
+ *   H    = AES_K(0)
+ *   ctr  = AES-CTR starting at IV||00000001 over (16 zero bytes || data): the first keystream
+ *          block is the tag mask E(J0), the rest is the GCM keystream starting at IV||00000002
+ *   tag  = GHASH_H(aad, ciphertext) ^ E(J0)
+ */
+struct u128 {
+	uint64_t hi, lo;
+};
+
+static void ghash_init(struct u128 M[16], const uint8_t h[16])
+{
+	struct u128 V;
+	int i, j;
+
+	V.hi = be64toh(*(const uint64_t *)h);
+	V.lo = be64toh(*(const uint64_t *)(h + 8));
+	M[0].hi = M[0].lo = 0;
+	M[8] = V;
+	for (i = 4; i > 0; i >>= 1) {
+		uint64_t T = 0xe100000000000000ULL & (0 - (V.lo & 1));
+		V.lo = (V.hi << 63) | (V.lo >> 1);
+		V.hi = (V.hi >> 1) ^ T;
+		M[i] = V;
+	}
+	for (i = 2; i < 16; i <<= 1)
+		for (j = 1; j < i; j++) {
+			M[i + j].hi = M[i].hi ^ M[j].hi;
+			M[i + j].lo = M[i].lo ^ M[j].lo;
+		}
+}
+
+static void ghash_mul(const struct u128 M[16], uint8_t x[16])
+{
+	static const uint64_t rem[16] = {
+		0x0000ULL << 48, 0x1c20ULL << 48, 0x3840ULL << 48, 0x2460ULL << 48,
+		0x7080ULL << 48, 0x6ca0ULL << 48, 0x48c0ULL << 48, 0x54e0ULL << 48,
+		0xe100ULL << 48, 0xfd20ULL << 48, 0xd940ULL << 48, 0xc560ULL << 48,
+		0x9180ULL << 48, 0x8da0ULL << 48, 0xa9c0ULL << 48, 0xb5e0ULL << 48};
+	struct u128 Z;
+	unsigned lo, hi, r;
+	int cnt = 15;
+
+	lo = x[15] & 0xf;
+	hi = x[15] >> 4;
+	Z = M[lo];
+	for (;;) {
+		r = Z.lo & 0xf;
+		Z.lo = (Z.hi << 60) | (Z.lo >> 4);
+		Z.hi = (Z.hi >> 4) ^ rem[r];
+		Z.hi ^= M[hi].hi;
+		Z.lo ^= M[hi].lo;
+		if (--cnt < 0)
+			break;
+		lo = x[cnt] & 0xf;
+		hi = x[cnt] >> 4;
+		r = Z.lo & 0xf;
+		Z.lo = (Z.hi << 60) | (Z.lo >> 4);
+		Z.hi = (Z.hi >> 4) ^ rem[r];
+		Z.hi ^= M[lo].hi;
+		Z.lo ^= M[lo].lo;
+	}
+	Z.hi = htobe64(Z.hi);
+	Z.lo = htobe64(Z.lo);
+	memcpy(x, &Z.hi, 8);
+	memcpy(x + 8, &Z.lo, 8);
+}
+
+static void ghash_update(const struct u128 M[16], uint8_t y[16], const uint8_t *d, size_t n)
+{
+	while (n) {
+		size_t k = n < 16 ? n : 16, i;
+		for (i = 0; i < k; i++)
+			y[i] ^= d[i];
+		ghash_mul(M, y);
+		d += k;
+		n -= k;
+	}
+}
+
+/* one AES operation through AF_ALG (hardware engine on the board) */
+static int aes_run(const char *name, const uint8_t *key, unsigned keylen, const uint8_t *iv,
+		   const uint8_t *in, size_t n, uint8_t *out)
+{
+	uint32_t op = ALG_OP_ENCRYPT;
+	char cbuf[CMSG_SPACE(sizeof(op)) + CMSG_SPACE(sizeof(struct af_alg_iv) + 16)] = {0};
+	struct iovec iov = {(void *)in, n};
+	struct msghdr msg = {.msg_iov = &iov,
+			     .msg_iovlen = 1,
+			     .msg_control = cbuf,
+			     .msg_controllen = sizeof(cbuf)};
+	struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+	int tfm, fd, ret;
+
+	fd = alg_open("skcipher", name, key, keylen, &tfm, 0);
+	if (fd < 0)
+		return fd;
+	close(tfm);
+	c->cmsg_level = SOL_ALG;
+	c->cmsg_type = ALG_SET_OP;
+	c->cmsg_len = CMSG_LEN(sizeof(op));
+	memcpy(CMSG_DATA(c), &op, sizeof(op));
+	if (iv) {
+		struct af_alg_iv *ai;
+		c = (struct cmsghdr *)(cbuf + CMSG_SPACE(sizeof(op)));
+		c->cmsg_level = SOL_ALG;
+		c->cmsg_type = ALG_SET_IV;
+		c->cmsg_len = CMSG_LEN(sizeof(*ai) + 16);
+		ai = (struct af_alg_iv *)CMSG_DATA(c);
+		ai->ivlen = 16;
+		memcpy(ai->iv, iv, 16);
+	} else {
+		msg.msg_controllen = CMSG_SPACE(sizeof(op));
+	}
+	if (sendmsg(fd, &msg, 0) < 0) {
+		ret = -errno;
+		close(fd);
+		return ret;
+	}
+	ret = read_full(fd, out, n);
+	close(fd);
+	return ret;
+}
+
+/* data = aad||text(||tag); reply = aad||text(||tag) */
+static void do_aead(const struct bbc_req *rq, const uint8_t *key, uint32_t keylen,
+		    const uint8_t *iv, uint32_t ivlen, const uint8_t *data, uint32_t datalen,
+		    struct reply *r, uint8_t *scratch)
+{
+	uint16_t fl = le16toh(rq->flags);
+	int dec = fl & BBC_F_DECRYPT;
+	unsigned tag = fl >> BBC_F_TAGSHIFT;
+	uint32_t assoc = le32toh(rq->id), tl;
+	struct u128 M[16];
+	uint8_t h[16], zero[16] = {0}, ctr[16], y[16] = {0}, lens[16], full[16];
+	uint8_t *tmp = NULL, *in = NULL;
+	const uint8_t *ct;
+	int ret, i;
+
+	if (le32toh(rq->alg) != BBC_ALG_GCM_AES || ivlen != 12) {
+		r->status = -EOPNOTSUPP;
+		return;
+	}
+	if (!tag || tag > 16 || assoc > datalen || (dec && datalen - assoc < tag)) {
+		r->status = -EINVAL;
+		return;
+	}
+	tl = datalen - assoc - (dec ? tag : 0); /* text length */
+	tmp = malloc(16 + tl + 16);
+	in = calloc(1, 16 + tl + 16);
+	if (!tmp || !in) {
+		r->status = -ENOMEM;
+		goto out;
+	}
+
+	ret = aes_run("ecb(aes)", key, keylen, NULL, zero, 16, h);
+	if (!ret) {
+		memcpy(ctr, iv, 12);
+		ctr[12] = ctr[13] = ctr[14] = 0;
+		ctr[15] = 1;
+		memcpy(in + 16, data + assoc, tl); /* ciphertext when decrypting: same XOR */
+		ret = aes_run("ctr(aes)", key, keylen, ctr, in, 16 + tl, tmp);
+	}
+	if (ret) {
+		r->status = ret;
+		goto out;
+	}
+	/* tmp = E(J0) || text xor keystream */
+	ct = dec ? data + assoc : tmp + 16;
+	ghash_init(M, h);
+	ghash_update(M, y, data, assoc);
+	ghash_update(M, y, ct, tl);
+	for (i = 0; i < 8; i++) {
+		lens[i] = ((uint64_t)assoc * 8) >> (56 - 8 * i);
+		lens[8 + i] = ((uint64_t)tl * 8) >> (56 - 8 * i);
+	}
+	ghash_update(M, y, lens, 16);
+	for (i = 0; i < 16; i++)
+		full[i] = y[i] ^ tmp[i];
+	if (dec) {
+		uint8_t diff = 0;
+		for (i = 0; i < (int)tag; i++)
+			diff |= full[i] ^ data[assoc + tl + i];
+		if (diff) {
+			r->status = -EBADMSG;
+			goto out;
+		}
+	}
+	memcpy(scratch, data, assoc);
+	memcpy(scratch + assoc, tmp + 16, tl);
+	if (!dec)
+		memcpy(scratch + assoc + tl, full, tag);
+	r->data = scratch;
+	r->datalen = assoc + tl + (dec ? 0 : tag);
+out:
+	free(tmp);
+	free(in);
+}
