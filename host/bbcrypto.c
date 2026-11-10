@@ -995,3 +995,302 @@ static void bbc_creq_progress(struct bbc_creq *cr)
 	bbc_put(d);
 	skcipher_request_complete(req, err); /* req (and cr) may be gone after this */
 }
+
+static void bbc_chunk_done(struct bbc_cmd *c)
+{
+	struct bbc_creq *cr = c->priv;
+	struct skcipher_request *req = cr->req;
+	int ret = c->status;
+
+	if (!ret) {
+		struct bbc_resp *rs = (struct bbc_resp *)c->rbuf;
+		u32 ilen = le32_to_cpu(rs->ivlen), dlen = le32_to_cpu(rs->datalen);
+		u8 *p = c->rbuf + sizeof(*rs);
+
+		ret = (s32)le32_to_cpu(rs->status);
+		if (!ret && dlen != c->len)
+			ret = -EPROTO;
+		if (!ret) {
+			if (cr->serial && ilen == AES_BLOCK_SIZE)
+				memcpy(cr->iv, p, AES_BLOCK_SIZE); /* CBC chain */
+			sg_pcopy_from_buffer(req->dst, sg_nents(req->dst), p + ilen, c->len,
+					     c->off);
+		}
+	}
+	if (ret && !cr->err)
+		cr->err = ret;
+	cr->inflight--;
+	bbc_creq_progress(cr);
+}
+
+static void bbc_creq_emit(struct bbc_creq *cr)
+{
+	struct skcipher_request *req = cr->req;
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	struct bbc_cipher_ctx *kc = crypto_skcipher_ctx(tfm);
+	u32 n = min_t(u32, cr->total - cr->off, chunk_sz());
+	struct bbc_cmd *c;
+	u8 *dp;
+
+	c = bbc_cmd_new(cr->d, BBC_OP_CIPHER, cr->dec ? BBC_F_DECRYPT : 0, 0, cr->alg, kc->key,
+			kc->keylen, cr->ivsize ? cr->iv : NULL, cr->ivsize, n,
+			sizeof(struct bbc_resp) + BBC_MAX_IV + n, &dp);
+	if (!c) {
+		cr->err = -ENOMEM;
+		bbc_creq_progress(cr);
+		return;
+	}
+	sg_pcopy_to_buffer(req->src, sg_nents(req->src), dp, n, cr->off);
+	c->off = cr->off;
+	c->len = n;
+
+	/* IV of the following chunk, where it can be known in advance */
+	if (cr->alg == BBC_ALG_CBC_AES && cr->dec)
+		memcpy(cr->iv, dp + n - AES_BLOCK_SIZE, AES_BLOCK_SIZE); /* last ciphertext block */
+	else if (cr->alg == BBC_ALG_CTR_AES)
+		bbc_ctr_add(cr->iv, DIV_ROUND_UP(n, AES_BLOCK_SIZE));
+	/* CBC encrypt: the board hands the chained IV back with each reply */
+
+	cr->off += n;
+	cr->inflight++;
+	bbc_cmd_submit(c, bbc_chunk_done, cr);
+}
+
+static int bbc_cipher_crypt(struct skcipher_request *req, bool dec)
+{
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	struct bbc_creq *cr = skcipher_request_ctx(req);
+	unsigned int bs = crypto_skcipher_blocksize(tfm);
+	struct bbc_dev *d;
+	unsigned long fl;
+
+	if (!req->cryptlen)
+		return 0;
+	if (bs > 1 && req->cryptlen % bs)
+		return -EINVAL;
+	d = bbc_get();
+	if (!d)
+		return -ENODEV;
+
+	memset(cr, 0, sizeof(*cr));
+	INIT_LIST_HEAD(&cr->node);
+	cr->req = req;
+	cr->d = d;
+	cr->total = req->cryptlen;
+	cr->dec = dec;
+	cr->alg = to_bsk(tfm)->id;
+	cr->serial = cr->alg == BBC_ALG_CBC_AES && !dec;
+	cr->ivsize = crypto_skcipher_ivsize(tfm);
+	if (cr->ivsize)
+		memcpy(cr->iv, req->iv, cr->ivsize);
+
+	spin_lock_irqsave(&d->lock, fl);
+	if (d->dead) {
+		spin_unlock_irqrestore(&d->lock, fl);
+		bbc_put(d);
+		return -ENODEV;
+	}
+	list_add_tail(&cr->node, &d->active);
+	spin_unlock_irqrestore(&d->lock, fl);
+	bbc_kick(d, &d->pump_work);
+	return -EINPROGRESS;
+}
+
+static int bbc_cipher_encrypt(struct skcipher_request *req)
+{
+	return bbc_cipher_crypt(req, false);
+}
+static int bbc_cipher_decrypt(struct skcipher_request *req)
+{
+	return bbc_cipher_crypt(req, true);
+}
+
+#define BBC_CIPHER(_alg, _name, _drv, _bs, _iv)                                                    \
+	{                                                                                          \
+		.id = _alg,                                                                        \
+		.alg = {.init = bbc_cipher_init,                                                   \
+			.setkey = bbc_cipher_setkey,                                               \
+			.encrypt = bbc_cipher_encrypt,                                             \
+			.decrypt = bbc_cipher_decrypt,                                             \
+			.min_keysize = AES_MIN_KEY_SIZE,                                           \
+			.max_keysize = AES_MAX_KEY_SIZE,                                           \
+			.ivsize = _iv,                                                             \
+			.chunksize = 16,                                                           \
+			.base = {.cra_name = _name,                                                \
+				 .cra_driver_name = _drv,                                          \
+				 .cra_blocksize = _bs,                                             \
+				 .cra_flags = CRYPTO_ALG_ASYNC | CRYPTO_ALG_ALLOCATES_MEMORY,      \
+				 .cra_ctxsize = sizeof(struct bbc_cipher_ctx),                     \
+				 .cra_module = THIS_MODULE} }                                      \
+	}
+
+static struct bbc_skcipher bbc_ciphers[] = {
+	BBC_CIPHER(BBC_ALG_ECB_AES, "ecb(aes)", "ecb-aes-bbcrypto", AES_BLOCK_SIZE, 0),
+	BBC_CIPHER(BBC_ALG_CBC_AES, "cbc(aes)", "cbc-aes-bbcrypto", AES_BLOCK_SIZE, AES_BLOCK_SIZE),
+	BBC_CIPHER(BBC_ALG_CTR_AES, "ctr(aes)", "ctr-aes-bbcrypto", 1, AES_BLOCK_SIZE),
+};
+
+/* ------------------------------------------------------------------ */
+/* ahash: the same hashes with a fully asynchronous interface          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * An ahash request is a small state machine driven by command completions:
+ *   [NEW] -> UPDATE* -> [FINAL]      or      ONESHOT (whole message fits one command)
+ * The board-side session (id/devid) is the persistent hash state and lives in the request
+ * context between calls; the rest of the context is per call.
+ */
+enum { AH_NEW, AH_UPD, AH_FIN, AH_ONE };
+
+struct bbc_ahreq {
+	u32 id, devid; /* persistent: board session */
+	struct ahash_request *req;
+	u32 total, off, n;
+	bool fin;
+	int stage;
+};
+
+struct bbc_ahash {
+	struct ahash_alg alg;
+	u32 id;
+	bool registered;
+};
+
+static struct bbc_ahash *to_bah(struct crypto_ahash *tfm)
+{
+	return container_of(crypto_ahash_alg(tfm), struct bbc_ahash, alg);
+}
+
+static int bbc_ah_init_tfm(struct crypto_ahash *tfm)
+{
+	crypto_ahash_set_reqsize(tfm, sizeof(struct bbc_ahreq));
+	return 0;
+}
+
+static int bbc_ah_setkey(struct crypto_ahash *tfm, const u8 *key, unsigned int len)
+{
+	struct bbc_hash_ctx *c = crypto_ahash_ctx(tfm);
+
+	if (len > BBC_MAX_KEY)
+		return -EINVAL;
+	memcpy(c->key, key, len);
+	c->keylen = len;
+	return 0;
+}
+
+static void bbc_ah_step(struct bbc_ahreq *ar);
+
+static void bbc_ah_done(struct bbc_cmd *c)
+{
+	struct bbc_ahreq *ar = c->priv;
+	struct ahash_request *req = ar->req;
+	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+	int ret = c->status;
+
+	if (!ret) {
+		struct bbc_resp *rs = (struct bbc_resp *)c->rbuf;
+		u32 ilen = le32_to_cpu(rs->ivlen), dlen = le32_to_cpu(rs->datalen);
+
+		ret = (s32)le32_to_cpu(rs->status);
+		if (!ret) {
+			switch (ar->stage) {
+			case AH_NEW:
+				ar->id = le32_to_cpu(rs->id);
+				ar->devid = c->d->devid;
+				bbc_ah_step(ar);
+				return;
+			case AH_UPD:
+				ar->off += ar->n;
+				bbc_ah_step(ar);
+				return;
+			default: /* FINAL / ONESHOT: the digest */
+				if (dlen > crypto_ahash_digestsize(tfm))
+					ret = -EMSGSIZE;
+				else
+					memcpy(req->result, c->rbuf + sizeof(*rs) + ilen, dlen);
+			}
+		}
+	}
+	ar->id = 0; /* finished, or the session is unusable */
+	ahash_request_complete(req, ret);
+}
+
+static void bbc_ah_step(struct bbc_ahreq *ar)
+{
+	struct ahash_request *req = ar->req;
+	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+	struct bbc_hash_ctx *kc = crypto_ahash_ctx(tfm);
+	u32 alg = to_bah(tfm)->id, left = ar->total - ar->off;
+	u16 op = BBC_OP_HASH_NEW, flags = 0, id = 0;
+	u32 n = 0, rcap = sizeof(struct bbc_resp) + 64;
+	const void *key = NULL;
+	u32 keylen = 0;
+	struct bbc_cmd *c;
+	struct bbc_dev *d;
+	u8 *dp;
+
+	if (!ar->id) {
+		if (!ar->fin && !left)
+			goto finished;
+		if (ar->fin && left <= BBC_MAX_DATA) {
+			ar->stage = AH_ONE;
+			flags = BBC_F_ONESHOT;
+			n = left;
+		} else {
+			ar->stage = AH_NEW;
+		}
+		key = kc->key;
+		keylen = kc->keylen;
+	} else if (left) {
+		ar->stage = AH_UPD;
+		op = BBC_OP_HASH_UPDATE;
+		id = ar->id;
+		n = ar->n = min_t(u32, left, BBC_MAX_DATA);
+	} else if (ar->fin) {
+		ar->stage = AH_FIN;
+		op = BBC_OP_HASH_FINAL;
+		id = ar->id;
+	} else {
+		goto finished;
+	}
+
+	d = ar->id ? bbc_get_id(ar->devid) : bbc_get();
+	if (!d) {
+		ar->id = 0;
+		ahash_request_complete(req, -ENODEV);
+		return;
+	}
+	c = bbc_cmd_new(d, op, flags, id, alg, key, keylen, NULL, 0, n, rcap, &dp);
+	bbc_put(d); /* the command holds its own reference */
+	if (!c) {
+		ar->id = 0;
+		ahash_request_complete(req, -ENOMEM);
+		return;
+	}
+	if (n)
+		sg_pcopy_to_buffer(req->src, sg_nents(req->src), dp, n, ar->off);
+	bbc_cmd_submit(c, bbc_ah_done, ar);
+	return;
+finished:
+	ahash_request_complete(req, 0);
+}
+
+static int bbc_ah_run(struct ahash_request *req, u32 total, bool fin)
+{
+	struct bbc_ahreq *ar = ahash_request_ctx(req);
+
+	ar->req = req;
+	ar->total = total;
+	ar->off = 0;
+	ar->fin = fin;
+	bbc_ah_step(ar);
+	return -EINPROGRESS;
+}
+
+static int bbc_ah_init(struct ahash_request *req)
+{
+	struct bbc_ahreq *ar = ahash_request_ctx(req);
+
+	ar->id = ar->devid = 0;
+	return 0;
+}
