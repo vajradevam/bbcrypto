@@ -547,3 +547,192 @@ out:
 	free(tmp);
 	free(in);
 }
+
+static void build_info(void)
+{
+	static const char *want[] = {"sha1",	 "sha256",   "hmac(sha256)", "ecb(aes)",
+				     "cbc(aes)", "ctr(aes)", "gcm(aes)"};
+	char best[7][48] = {{0}};
+	int bestp[7] = {-1, -1, -1, -1, -1, -1, -1};
+	char line[256], name[64] = "", drv[64] = "";
+	int prio = 0, i;
+	FILE *f = fopen("/proc/crypto", "r");
+	size_t off;
+
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "name : %63s", name) == 1)
+			continue;
+		if (sscanf(line, "driver : %63s", drv) == 1)
+			continue;
+		if (sscanf(line, "priority : %d", &prio) == 1) {
+			for (i = 0; i < 7; i++)
+				if (!strcmp(name, want[i]) && prio > bestp[i]) {
+					bestp[i] = prio;
+					snprintf(best[i], sizeof(best[i]), "%s", drv);
+				}
+		}
+	}
+	fclose(f);
+	off = snprintf(info, sizeof(info), "bbcryptod:");
+	for (i = 0; i < 7 && off < sizeof(info) - 60; i++)
+		off += snprintf(info + off, sizeof(info) - off, " %s=%s", want[i],
+				best[i][0] ? best[i] : "-");
+}
+
+/* ------------------------------ serving loop ------------------------------ */
+
+/*
+ * Receiving is done by a dedicated thread that always has the next read() queued.
+ * On the AM335x MUSB gadget a packet that arrives while no read is queued can be lost
+ * (the first 512-byte packet of the next request was observed to vanish when the daemon
+ * was busy answering the previous one), so the read must be posted before the response
+ * to the previous request is even written.
+ */
+#include <semaphore.h>
+#include <linux/aio_abi.h>
+#include <sys/syscall.h>
+#include <time.h>
+
+/*
+ * Receiving.
+ *
+ * On the AM335x MUSB gadget a packet that arrives while no read is queued on the endpoint
+ * can be lost (the first 512-byte packet of an OUT transfer simply vanishes). A thread
+ * that calls read() in a loop always leaves a gap between one read finishing and the next
+ * being posted, and with several requests pipelined by the host that gap is hit all the
+ * time. So the reads are submitted with kernel AIO: NSLOT of them sit queued on the
+ * endpoint at all times, and a request buffer is only taken out of the queue while it is
+ * being served. The harvester thread below collects completions in arrival order,
+ * reassembles a request that arrived in pieces, drops pad bytes and hands whole requests
+ * to the serving loop.
+ */
+#define NSLOT 12
+
+/*
+ * Replies are kept so that a host retry of ANY recent request (several can be in flight)
+ * is answered from the cache instead of being executed a second time. Must be larger
+ * than the host's in-flight window.
+ */
+#define NCACHE 16
+static struct cached {
+	uint32_t tag;
+	size_t len;
+	uint8_t buf[BUFSZ];
+} cache[NCACHE];
+static unsigned cache_next;
+
+static struct cached *cache_find(uint32_t tag)
+{
+	int k;
+
+	for (k = 0; k < NCACHE; k++)
+		if (cache[k].len && cache[k].tag == tag)
+			return &cache[k];
+	return NULL;
+}
+
+static struct slot {
+	uint8_t buf[BUFSZ];
+	ssize_t n;
+	struct iocb cb;
+} slots[NSLOT];
+static int ready_q[NSLOT + 1]; /* slot indices handed to the serving loop; -1 = stream ended */
+static unsigned ready_head, ready_tail;
+static pthread_mutex_t ready_mu = PTHREAD_MUTEX_INITIALIZER;
+static sem_t sem_full;
+static aio_context_t aio_ctx;
+static int rx_fd, rx_on;
+static volatile int rx_quit;
+static pthread_t rx_th;
+
+static int slot_submit(int i)
+{
+	struct iocb *p = &slots[i].cb;
+
+	memset(p, 0, sizeof(*p));
+	p->aio_lio_opcode = IOCB_CMD_PREAD;
+	p->aio_fildes = rx_fd;
+	p->aio_buf = (uintptr_t)slots[i].buf;
+	p->aio_nbytes = BUFSZ;
+	p->aio_data = i;
+	if (syscall(SYS_io_submit, aio_ctx, 1, &p) != 1) {
+		perror("io_submit");
+		return -1;
+	}
+	return 0;
+}
+
+static void ready_push(int i, ssize_t n)
+{
+	if (i >= 0)
+		slots[i].n = n;
+	pthread_mutex_lock(&ready_mu);
+	ready_q[ready_tail++ % (NSLOT + 1)] = i;
+	pthread_mutex_unlock(&ready_mu);
+	sem_post(&sem_full);
+}
+
+static int ready_pop(void)
+{
+	int i;
+
+	pthread_mutex_lock(&ready_mu);
+	i = ready_q[ready_head++ % (NSLOT + 1)];
+	pthread_mutex_unlock(&ready_mu);
+	return i;
+}
+
+/*
+ * Replies are transmitted by their own thread, so the next request can be computed while the
+ * previous reply is still going out over the cable. Bounded to WQN entries, which keeps the
+ * writer at most WQN replies behind - fewer than NCACHE, so a cached reply is never
+ * overwritten while it is still being sent.
+ */
+#define WQN 8
+static struct cached *wq_q[WQN];
+static unsigned wq_head, wq_tail;
+static sem_t sem_wfree, sem_wfull;
+static pthread_mutex_t wq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t wr_th;
+static int wr_on, wr_fd;
+static volatile int wr_quit, wr_failed;
+
+static void *wr_thread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		struct cached *ce;
+
+		while (sem_wait(&sem_wfull) < 0 && errno == EINTR)
+			;
+		if (wr_quit)
+			return NULL;
+		pthread_mutex_lock(&wq_mu);
+		ce = wq_q[wq_head++ % WQN];
+		pthread_mutex_unlock(&wq_mu);
+		if (write(wr_fd, ce->buf, ce->len) < 0) {
+			if (verbose)
+				perror("write ep2");
+			wr_failed = 1;
+			ready_push(-1, 0); /* wake the serving loop */
+			return NULL;
+		}
+		sem_post(&sem_wfree);
+	}
+}
+
+/* queue a reply for transmission; returns -1 if the writer has failed */
+static int reply_send(struct cached *ce)
+{
+	while (sem_wait(&sem_wfree) < 0 && errno == EINTR)
+		;
+	if (wr_failed)
+		return -1;
+	pthread_mutex_lock(&wq_mu);
+	wq_q[wq_tail++ % WQN] = ce;
+	pthread_mutex_unlock(&wq_mu);
+	sem_post(&sem_wfull);
+	return 0;
+}
