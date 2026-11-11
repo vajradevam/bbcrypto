@@ -1294,3 +1294,181 @@ static int bbc_ah_init(struct ahash_request *req)
 	ar->id = ar->devid = 0;
 	return 0;
 }
+
+static int bbc_ah_update(struct ahash_request *req)
+{
+	return bbc_ah_run(req, req->nbytes, false);
+}
+static int bbc_ah_final(struct ahash_request *req)
+{
+	return bbc_ah_run(req, 0, true);
+}
+static int bbc_ah_finup(struct ahash_request *req)
+{
+	return bbc_ah_run(req, req->nbytes, true);
+}
+
+static int bbc_ah_digest(struct ahash_request *req)
+{
+	bbc_ah_init(req);
+	return bbc_ah_finup(req);
+}
+
+/* the state is the board session: export clones it, as for the shash */
+static int bbc_ah_export(struct ahash_request *req, void *out)
+{
+	struct bbc_ahreq *ar = ahash_request_ctx(req);
+	struct bbc_dev *d;
+	struct bbc_out o = {};
+	u32 id = 0, devid = 0;
+	int ret;
+
+	if (ar->id) {
+		d = bbc_get_id(ar->devid);
+		if (!d)
+			return -ENODEV;
+		ret = bbc_xfer(d, BBC_OP_HASH_CLONE, 0, ar->id, 0, NULL, 0, NULL, 0, NULL, 0, &o);
+		devid = d->devid;
+		bbc_put(d);
+		if (ret)
+			return ret;
+		id = o.id;
+	}
+	put_unaligned_le32(id, out);
+	put_unaligned_le32(devid, out + 4);
+	return 0;
+}
+
+static int bbc_ah_import(struct ahash_request *req, const void *in)
+{
+	struct bbc_ahreq *ar = ahash_request_ctx(req);
+
+	ar->id = get_unaligned_le32(in);
+	ar->devid = get_unaligned_le32(in + 4);
+	return 0;
+}
+
+#define BBC_AHASH(_alg, _name, _drv, _dsz, _bsz, _hmac)                                            \
+	{                                                                                          \
+		.id = _alg,                                                                        \
+		.alg = {.init = bbc_ah_init,                                                       \
+			.update = bbc_ah_update,                                                   \
+			.final = bbc_ah_final,                                                     \
+			.finup = bbc_ah_finup,                                                     \
+			.digest = bbc_ah_digest,                                                   \
+			.export = bbc_ah_export,                                                   \
+			.import = bbc_ah_import,                                                   \
+			.init_tfm = bbc_ah_init_tfm,                                               \
+			.setkey = (_hmac) ? bbc_ah_setkey : NULL,                                  \
+			.halg = {.digestsize = _dsz,                                               \
+				 .statesize = 2 * sizeof(u32),                                     \
+				 .base = {.cra_name = _name,                                       \
+					  .cra_driver_name = _drv,                                 \
+					  .cra_blocksize = _bsz,                                   \
+					  .cra_flags = CRYPTO_ALG_ASYNC |                          \
+						       CRYPTO_ALG_ALLOCATES_MEMORY |               \
+						       CRYPTO_AHASH_ALG_NO_EXPORT_CORE,            \
+					  .cra_ctxsize = sizeof(struct bbc_hash_ctx),              \
+					  .cra_module = THIS_MODULE}} }                            \
+	}
+
+static struct bbc_ahash bbc_ahashes[] = {
+	BBC_AHASH(BBC_ALG_SHA1, "sha1", "sha1-async-bbcrypto", SHA1_DIGEST_SIZE, SHA1_BLOCK_SIZE,
+		  false),
+	BBC_AHASH(BBC_ALG_SHA256, "sha256", "sha256-async-bbcrypto", SHA256_DIGEST_SIZE,
+		  SHA256_BLOCK_SIZE, false),
+	BBC_AHASH(BBC_ALG_HMAC_SHA256, "hmac(sha256)", "hmac-sha256-async-bbcrypto",
+		  SHA256_DIGEST_SIZE, SHA256_BLOCK_SIZE, true),
+};
+
+/* ------------------------------------------------------------------ */
+/* gcm(aes) (AEAD, asynchronous)                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * GCM cannot be split into independent chunks the way ECB/CTR can, so one request is one
+ * command and assoclen + cryptlen must fit BBC_MAX_DATA (32 KiB, minus the tag on
+ * encryption); larger requests fail with -EINVAL.
+ */
+struct bbc_aead_ctx {
+	u8 key[AES_MAX_KEY_SIZE];
+	u32 keylen;
+};
+
+struct bbc_aead {
+	struct aead_alg alg;
+	bool registered;
+};
+
+static int bbc_aead_init(struct crypto_aead *tfm)
+{
+	crypto_aead_set_reqsize(tfm, 0);
+	return 0;
+}
+
+static int bbc_aead_setkey(struct crypto_aead *tfm, const u8 *key, unsigned int len)
+{
+	struct bbc_aead_ctx *c = crypto_aead_ctx(tfm);
+
+	if (len != AES_KEYSIZE_128 && len != AES_KEYSIZE_192 && len != AES_KEYSIZE_256)
+		return -EINVAL;
+	memcpy(c->key, key, len);
+	c->keylen = len;
+	return 0;
+}
+
+static int bbc_aead_setauthsize(struct crypto_aead *tfm, unsigned int sz)
+{
+	return crypto_gcm_check_authsize(sz);
+}
+
+static void bbc_aead_done(struct bbc_cmd *c)
+{
+	struct aead_request *req = c->priv;
+	int ret = c->status;
+
+	if (!ret) {
+		struct bbc_resp *rs = (struct bbc_resp *)c->rbuf;
+		u32 ilen = le32_to_cpu(rs->ivlen), dlen = le32_to_cpu(rs->datalen);
+
+		ret = (s32)le32_to_cpu(rs->status); /* -EBADMSG: tag mismatch */
+		if (!ret)
+			sg_pcopy_from_buffer(req->dst, sg_nents(req->dst),
+					     c->rbuf + sizeof(*rs) + ilen, dlen, 0);
+	}
+	aead_request_complete(req, ret);
+}
+
+static int bbc_aead_crypt(struct aead_request *req, bool dec)
+{
+	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+	struct bbc_aead_ctx *kc = crypto_aead_ctx(tfm);
+	u32 tag = crypto_aead_authsize(tfm), n = req->assoclen + req->cryptlen;
+	struct bbc_cmd *c;
+	struct bbc_dev *d;
+	u8 *dp;
+
+	if (n + (dec ? 0 : tag) > BBC_MAX_DATA || (dec && req->cryptlen < tag))
+		return -EINVAL;
+	d = bbc_get();
+	if (!d)
+		return -ENODEV;
+	c = bbc_cmd_new(d, BBC_OP_AEAD, (dec ? BBC_F_DECRYPT : 0) | (tag << BBC_F_TAGSHIFT),
+			req->assoclen, BBC_ALG_GCM_AES, kc->key, kc->keylen, req->iv,
+			GCM_AES_IV_SIZE, n, sizeof(struct bbc_resp) + BBC_MAX_IV + n + tag, &dp);
+	bbc_put(d);
+	if (!c)
+		return -ENOMEM;
+	sg_pcopy_to_buffer(req->src, sg_nents(req->src), dp, n, 0);
+	bbc_cmd_submit(c, bbc_aead_done, req);
+	return -EINPROGRESS;
+}
+
+static int bbc_aead_encrypt(struct aead_request *req)
+{
+	return bbc_aead_crypt(req, false);
+}
+static int bbc_aead_decrypt(struct aead_request *req)
+{
+	return bbc_aead_crypt(req, true);
+}
