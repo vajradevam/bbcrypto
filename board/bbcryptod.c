@@ -736,3 +736,114 @@ static int reply_send(struct cached *ce)
 	sem_post(&sem_wfull);
 	return 0;
 }
+
+static void rx_stop(void)
+{
+	if (wr_on) {
+		pthread_cancel(wr_th); /* it may be blocked inside write() */
+		pthread_join(wr_th, NULL);
+		wr_on = 0;
+	}
+	if (rx_on) {
+		rx_quit = 1;
+		pthread_join(rx_th, NULL);
+		rx_on = 0;
+	}
+	if (aio_ctx) {
+		syscall(SYS_io_destroy, aio_ctx); /* cancels the reads still queued */
+		aio_ctx = 0;
+	}
+}
+
+static void *rx_thread(void *arg)
+{
+	struct io_event ev[NSLOT];
+	int asm_slot = -1, expect_pad = 0;
+	size_t have = 0, need = 0;
+
+	(void)arg;
+	while (!rx_quit) {
+		/* the io_getevents syscall takes the 32-bit timespec even where libc's is 64-bit */
+		struct {
+			int32_t sec, nsec;
+		} ts = {0, 100 * 1000 * 1000};
+		long r = syscall(SYS_io_getevents, aio_ctx, 1, NSLOT, ev, &ts);
+		long k;
+
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		for (k = 0; k < r; k++) {
+			int i = (int)ev[k].data;
+			ssize_t n = (ssize_t)ev[k].res;
+			uint8_t *p = slots[i].buf;
+			struct bbc_req *rq = (struct bbc_req *)p;
+
+			if (n < 0) {
+				if (verbose)
+					fprintf(stderr, "read failed: %zd\n", -n);
+				ready_push(-1, 0); /* endpoint went away */
+				return NULL;
+			}
+			if (verbose)
+				fprintf(stderr, "rd %zd\n", n);
+
+			/* a request that is a multiple of 512 bytes is followed by one pad byte */
+			if (expect_pad) {
+				expect_pad = 0;
+				if (n == 1) {
+					slot_submit(i);
+					continue;
+				}
+			}
+			if (asm_slot >= 0) {
+				/* a fresh request header means the rest of the old one was lost */
+				if (!((size_t)n >= sizeof(*rq) &&
+				      le32toh(rq->magic) == BBC_MAGIC)) {
+					if (have + n <= BUFSZ) {
+						memcpy(slots[asm_slot].buf + have, p, n);
+						have += n;
+					}
+					slot_submit(i);
+					if (have >= need) {
+						if (need % 512 == 0 && have == need)
+							expect_pad = 1;
+						ready_push(asm_slot, have);
+						asm_slot = -1;
+					}
+					continue;
+				}
+				if (verbose)
+					fprintf(stderr,
+						"dropping incomplete request (%zu of %zu)\n", have,
+						need);
+				slot_submit(asm_slot);
+				asm_slot = -1;
+			}
+			if ((size_t)n >= sizeof(*rq) && le32toh(rq->magic) == BBC_MAGIC) {
+				uint64_t want = (uint64_t)sizeof(*rq) + le32toh(rq->keylen) +
+						le32toh(rq->ivlen) + le32toh(rq->datalen);
+				if (want <= BBC_MAX_MSG) {
+					if ((size_t)n >= want) {
+						if (want % 512 == 0 && (size_t)n == want)
+							expect_pad = 1;
+						ready_push(i, n);
+					} else {
+						asm_slot = i;
+						have = n;
+						need = want;
+					}
+					continue;
+				}
+			}
+			fprintf(stderr, "bad data (%zd bytes):", n);
+			for (int j = 0; j < n && j < 24; j++)
+				fprintf(stderr, " %02x", p[j]);
+			fprintf(stderr, "\n");
+			slot_submit(i);
+		}
+	}
+	return NULL;
+}
