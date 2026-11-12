@@ -249,3 +249,81 @@ static void t_cipher(const char *ref, const char *dut, unsigned kl, unsigned ivl
 		free(c);
 	}
 }
+
+/* AEAD through AF_ALG. in = aad||text (enc) or aad||ct||tag (dec); out = aad||ct||tag or aad||pt.
+ * Returns the number of bytes read, or -errno. */
+static long aead(const char *name, const uint8_t *key, unsigned kl, const uint8_t *iv, int dec,
+		 unsigned al, unsigned tag, const uint8_t *in, size_t n, uint8_t *out)
+{
+	struct sockaddr_alg sa = {.salg_family = AF_ALG};
+	int t = socket(AF_ALG, SOCK_SEQPACKET, 0), fd;
+	uint32_t op = dec ? ALG_OP_DECRYPT : ALG_OP_ENCRYPT;
+	char cb[CMSG_SPACE(4) + CMSG_SPACE(sizeof(struct af_alg_iv) + 16) + CMSG_SPACE(4)] = {0};
+	struct iovec iov = {(void *)in, n};
+	struct msghdr m = {
+		.msg_iov = &iov, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof(cb)};
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+	struct af_alg_iv *ai;
+	size_t cl = CMSG_SPACE(4), outn = dec ? n - tag : n + tag;
+	long r;
+
+	if (t < 0)
+		return -errno;
+	strcpy((char *)sa.salg_type, "aead");
+	strncpy((char *)sa.salg_name, name, sizeof(sa.salg_name) - 1);
+	if (bind(t, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
+	    setsockopt(t, SOL_ALG, ALG_SET_KEY, key, kl) < 0 ||
+	    setsockopt(t, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, tag) < 0 ||
+	    (fd = accept(t, NULL, NULL)) < 0) {
+		r = -errno;
+		close(t);
+		return r;
+	}
+	cm->cmsg_level = SOL_ALG;
+	cm->cmsg_type = ALG_SET_OP;
+	cm->cmsg_len = CMSG_LEN(4);
+	memcpy(CMSG_DATA(cm), &op, 4);
+	cm = (struct cmsghdr *)(cb + cl);
+	cm->cmsg_level = SOL_ALG;
+	cm->cmsg_type = ALG_SET_IV;
+	cm->cmsg_len = CMSG_LEN(sizeof(*ai) + 12);
+	ai = (void *)CMSG_DATA(cm);
+	ai->ivlen = 12;
+	memcpy(ai->iv, iv, 12);
+	cl += CMSG_SPACE(sizeof(*ai) + 12);
+	cm = (struct cmsghdr *)(cb + cl);
+	cm->cmsg_level = SOL_ALG;
+	cm->cmsg_type = ALG_SET_AEAD_ASSOCLEN;
+	cm->cmsg_len = CMSG_LEN(4);
+	memcpy(CMSG_DATA(cm), &al, 4);
+	cl += CMSG_SPACE(4);
+	m.msg_controllen = cl;
+	if (sendmsg(fd, &m, 0) < 0) {
+		r = -errno;
+		goto out;
+	}
+	r = read(fd, out, outn);
+	if (r < 0)
+		r = -errno;
+	else if ((size_t)r != outn)
+		r = -EIO;
+out:
+	close(fd);
+	close(t);
+	return r;
+}
+
+static char gcmref[64];
+static int find_gcm_reference(const char *aes_inner)
+{
+	static const char *gh[] = {"ghash-generic", "ghash-lib"};
+	uint8_t key[16] = {0}, iv[12] = {0}, o[48];
+	for (unsigned i = 0; i < 2; i++) {
+		snprintf(gcmref, sizeof(gcmref), "gcm_base(ctr(%s),%s)", aes_inner, gh[i]);
+		if (aead(gcmref, key, 16, iv, 0, 0, 16, key, 16, o) >= 0) {
+			printf("INFO GCM reference: %s\n", gcmref);
+			return 0;
+		}
+	}
+	return -1;
+}
