@@ -129,3 +129,134 @@ static int docipher(int dec, const char *mode, const unsigned char *key, int kl,
 	while (got < len) {
 		n = read(o, out + got, len - got);
 		if (n <= 0) {
+			perror("read");
+			return 1;
+		}
+		got += n;
+	}
+	fwrite(out, 1, len, stdout);
+	return 0;
+}
+static int dogcm(int dec, const unsigned char *key, int kl, const unsigned char *iv,
+		 const unsigned char *aad, int al)
+{
+	struct sockaddr_alg sa = {.salg_family = AF_ALG};
+	strcpy((char *)sa.salg_type, "aead");
+	strncpy((char *)sa.salg_name, sw ? "gcm(aes)" : "gcm-aes-bbcrypto",
+		sizeof sa.salg_name - 1);
+	int t = socket(AF_ALG, SOCK_SEQPACKET, 0);
+	if (t < 0 || bind(t, (void *)&sa, sizeof sa)) {
+		perror("gcm");
+		return 1;
+	}
+	if (setsockopt(t, SOL_ALG, ALG_SET_KEY, key, kl) ||
+	    setsockopt(t, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, 16)) {
+		perror("setkey");
+		return 1;
+	}
+	int o = accept(t, 0, 0);
+	if (o < 0) {
+		perror("accept");
+		return 1;
+	}
+	size_t cap = 1 << 16, len = 0;
+	unsigned char *in = malloc(cap + al + 32);
+	ssize_t n;
+	memcpy(in, aad, al);
+	while ((n = read(0, in + al + len, cap - len)) > 0) {
+		len += n;
+		if (len == cap) {
+			cap *= 2;
+			in = realloc(in, cap + al + 32);
+		}
+	}
+	if (dec && len < 16) {
+		fprintf(stderr, "input shorter than a tag\n");
+		return 1;
+	}
+	size_t outn = dec ? len - 16 : len + 16;
+	unsigned char *out = malloc(al + outn + 16);
+	char cbuf[CMSG_SPACE(4) + CMSG_SPACE(4 + 12) + CMSG_SPACE(4)] = {0};
+	struct msghdr m = {.msg_control = cbuf, .msg_controllen = sizeof cbuf};
+	struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+	c->cmsg_level = SOL_ALG;
+	c->cmsg_type = ALG_SET_OP;
+	c->cmsg_len = CMSG_LEN(4);
+	*(int *)CMSG_DATA(c) = dec ? ALG_OP_DECRYPT : ALG_OP_ENCRYPT;
+	c = CMSG_NXTHDR(&m, c);
+	c->cmsg_level = SOL_ALG;
+	c->cmsg_type = ALG_SET_IV;
+	c->cmsg_len = CMSG_LEN(4 + 12);
+	*(unsigned *)CMSG_DATA(c) = 12;
+	memcpy(CMSG_DATA(c) + 4, iv, 12);
+	c = CMSG_NXTHDR(&m, c);
+	c->cmsg_level = SOL_ALG;
+	c->cmsg_type = ALG_SET_AEAD_ASSOCLEN;
+	c->cmsg_len = CMSG_LEN(4);
+	*(unsigned *)CMSG_DATA(c) = al;
+	struct iovec v = {in, al + len};
+	m.msg_iov = &v;
+	m.msg_iovlen = 1;
+	if (sendmsg(o, &m, 0) < 0) {
+		perror("sendmsg");
+		return 1;
+	}
+	n = read(o, out, al + outn);
+	if (n < 0) {
+		if (errno == EBADMSG)
+			fprintf(stderr, "authentication failed\n");
+		else
+			perror("read");
+		return 1;
+	}
+	fwrite(out + al, 1, n - al, stdout);
+	return 0;
+}
+int main(int ac, char **av)
+{
+	if (ac > 1 && !strcmp(av[1], "-b")) {
+		sw = 1;
+		av++;
+		ac--;
+	}
+	unsigned char key[64], iv[16] = {0};
+	if (ac >= 3 && !strcmp(av[1], "hash")) {
+		char n[32];
+		snprintf(n, sizeof n, "%s-bbcrypto", av[2]);
+		int fd = ac > 3 ? open(av[3], O_RDONLY) : 0;
+		if (fd < 0) {
+			perror(av[3]);
+			return 1;
+		}
+		return dohash(sw ? av[2] : n, 0, 0, fd);
+	}
+	if (ac >= 3 && !strcmp(av[1], "hmac")) {
+		int kl = hex(av[2], key, 64);
+		int fd = ac > 3 ? open(av[3], O_RDONLY) : 0;
+		if (fd < 0) {
+			perror(av[3]);
+			return 1;
+		}
+		return dohash(sw ? "hmac(sha256)" : "hmac-sha256-bbcrypto", key, kl, fd);
+	}
+	if (ac >= 5 && (!strcmp(av[1], "enc") || !strcmp(av[1], "dec"))) {
+		int kl = hex(av[3], key, 32), il = ac > 5 ? hex(av[4 + 1], iv, 16) : 0;
+		return docipher(!strcmp(av[1], "dec"), av[2], key, kl, iv, il);
+	}
+	if (ac >= 4 && (!strcmp(av[1], "gcm-enc") || !strcmp(av[1], "gcm-dec"))) {
+		unsigned char aad[256];
+		int kl = hex(av[2], key, 32), il = hex(av[3], iv, 12),
+		    al = ac > 4 ? hex(av[4], aad, 256) : 0;
+		if (il != 12) {
+			fprintf(stderr, "gcm needs a 12-byte iv\n");
+			return 2;
+		}
+		return dogcm(!strcmp(av[1], "gcm-dec"), key, kl, iv, aad, al);
+	}
+	fprintf(stderr, "usage: bbcrypt [-b] hash sha1|sha256 [file]\n       bbcrypt [-b] hmac "
+			"<hexkey> [file]\n"
+			"       bbcrypt [-b] enc|dec ecb|cbc|ctr <hexkey> [hexiv] <in >out\n       "
+			"bbcrypt [-b] gcm-enc|gcm-dec <hexkey> <hexiv12> [hexaad] <in >out\n  -b = "
+			"use in-kernel implementation, not the board\n");
+	return 2;
+}
