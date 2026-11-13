@@ -847,3 +847,149 @@ static void *rx_thread(void *arg)
 	}
 	return NULL;
 }
+
+static void serve(int in_fd, int out_fd)
+{
+	static uint8_t scratch[BBC_MAX_DATA + 64];
+	int i, k;
+
+	memset(cache, 0, sizeof(cache));
+	cache_next = 0;
+	ready_head = ready_tail = 0;
+	rx_quit = 0;
+
+	rx_fd = in_fd;
+	wr_fd = out_fd;
+	wq_head = wq_tail = 0;
+	wr_quit = wr_failed = 0;
+	sem_init(&sem_full, 0, 0);
+	sem_init(&sem_wfree, 0, WQN);
+	sem_init(&sem_wfull, 0, 0);
+	if (syscall(SYS_io_setup, NSLOT, &aio_ctx) < 0) {
+		perror("io_setup");
+		return;
+	}
+	for (i = 0; i < NSLOT; i++)
+		if (slot_submit(i) < 0) {
+			rx_stop();
+			return;
+		}
+	if (pthread_create(&wr_th, NULL, wr_thread, NULL)) {
+		rx_stop();
+		return;
+	}
+	wr_on = 1;
+	if (pthread_create(&rx_th, NULL, rx_thread, NULL)) {
+		rx_stop();
+		return;
+	}
+	rx_on = 1;
+
+	for (;;) {
+		uint8_t *rbuf;
+		ssize_t n;
+		struct bbc_req *rq;
+		struct cached *ce;
+		struct bbc_resp *rs;
+		struct reply r = {0};
+		uint32_t kl, il, dl;
+		const uint8_t *key, *iv, *data;
+		uint16_t op;
+		size_t len;
+
+		while (sem_wait(&sem_full) < 0 && errno == EINTR)
+			;
+		i = ready_pop();
+		if (i < 0)
+			break; /* the endpoint went away */
+		rbuf = slots[i].buf;
+		rq = (struct bbc_req *)rbuf;
+		n = slots[i].n;
+		if ((size_t)n < sizeof(*rq) || le32toh(rq->magic) != BBC_MAGIC) {
+			fprintf(stderr, "bad request (%zd bytes):", n);
+			for (k = 0; k < n && k < 40; k++)
+				fprintf(stderr, " %02x", rbuf[k]);
+			fprintf(stderr, "\n");
+			slot_submit(i);
+			continue; /* cannot answer without a tag */
+		}
+		ce = cache_find(le32toh(rq->tag));
+		if (ce) {
+			/* host retried: it never saw our answer. Resend it, do not execute twice.
+			 */
+			if (verbose)
+				fprintf(stderr, "dup tag %u: resending cached reply\n", ce->tag);
+			slot_submit(i);
+			if (reply_send(ce) < 0)
+				break;
+			continue;
+		}
+		op = le16toh(rq->op);
+		kl = le32toh(rq->keylen);
+		il = le32toh(rq->ivlen);
+		dl = le32toh(rq->datalen);
+		if (kl > BBC_MAX_KEY || il > BBC_MAX_IV || dl > BBC_MAX_DATA ||
+		    sizeof(*rq) + kl + il + dl > (size_t)n) {
+			r.status = -EINVAL;
+			goto reply;
+		}
+		key = rbuf + sizeof(*rq);
+		iv = key + kl;
+		data = iv + il;
+
+		switch (op) {
+		case BBC_OP_PING:
+			memcpy(scratch, data, dl);
+			r.data = scratch;
+			r.datalen = dl;
+			break;
+		case BBC_OP_INFO:
+			r.data = (uint8_t *)info;
+			r.datalen = strlen(info);
+			break;
+		case BBC_OP_HASH_NEW:
+		case BBC_OP_HASH_UPDATE:
+		case BBC_OP_HASH_FINAL:
+		case BBC_OP_HASH_CLONE:
+		case BBC_OP_HASH_FREE:
+			do_hash(rq, op, key, kl, data, dl, &r, scratch);
+			break;
+		case BBC_OP_CIPHER:
+			do_cipher(rq, key, kl, iv, il, data, dl, &r, scratch);
+			break;
+		case BBC_OP_AEAD:
+			do_aead(rq, key, kl, iv, il, data, dl, &r, scratch);
+			break;
+		default:
+			r.status = -ENOSYS;
+		}
+	reply:
+		if (verbose)
+			fprintf(stderr,
+				"op %u tag %u alg %u key %u iv %u data %u (n=%zd) -> status %d out "
+				"%u\n",
+				op, le32toh(rq->tag), le32toh(rq->alg), kl, il, dl, n, r.status,
+				r.datalen);
+		ce = &cache[cache_next++ % NCACHE];
+		ce->len = 0;
+		rs = (struct bbc_resp *)ce->buf;
+		rs->magic = htole32(BBC_MAGIC);
+		rs->tag = rq->tag;
+		rs->status = htole32((uint32_t)r.status);
+		rs->id = htole32(r.id);
+		rs->ivlen = htole32(r.ivlen);
+		rs->datalen = htole32(r.datalen);
+		memcpy(ce->buf + sizeof(*rs), r.iv, r.ivlen);
+		if (r.datalen)
+			memcpy(ce->buf + sizeof(*rs) + r.ivlen, r.data, r.datalen);
+		len = sizeof(*rs) + r.ivlen + r.datalen;
+		if (len % 512 == 0)
+			ce->buf[len++] = 0;
+		slot_submit(i); /* request consumed: queue its buffer for reading again */
+		ce->tag = le32toh(rs->tag);
+		ce->len = len;
+		if (reply_send(ce) < 0)
+			break;
+	}
+	rx_stop();
+}
