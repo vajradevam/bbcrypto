@@ -1663,3 +1663,114 @@ static ssize_t ping_store(struct device *dev, struct device_attribute *attr, con
 			 div64_s64((s64)size * count * 1000000, us * 1024));
 	return len;
 }
+
+static ssize_t ping_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct bbc_dev *d = usb_get_intfdata(to_usb_interface(dev));
+
+	return sysfs_emit(buf, "%s", d->bench[0] ? d->bench : "(no run yet)\n");
+}
+static DEVICE_ATTR_RW(ping);
+
+static int bbc_probe(struct usb_interface *intf, const struct usb_device_id *id)
+{
+	struct usb_endpoint_descriptor *ein, *eout;
+	struct bbc_dev *d;
+	struct bbc_out o = {};
+	unsigned long fl;
+	int ret;
+
+	ret = usb_find_common_endpoints(intf->cur_altsetting, &ein, &eout, NULL, NULL);
+	if (ret)
+		return ret;
+
+	d = kzalloc(sizeof(*d), GFP_KERNEL);
+	if (!d)
+		return -ENOMEM;
+	kref_init(&d->ref);
+	/* random start: the board keeps recent replies by tag across a module reload, a fixed start
+	 * would replay them */
+	d->tag = get_random_u32();
+	spin_lock_init(&d->lock);
+	INIT_LIST_HEAD(&d->queue);
+	INIT_LIST_HEAD(&d->inflight);
+	INIT_LIST_HEAD(&d->donelist);
+	INIT_LIST_HEAD(&d->active);
+	INIT_WORK(&d->pump_work, bbc_pump_work);
+	INIT_WORK(&d->done_work, bbc_done_work);
+	INIT_WORK(&d->fail_work, bbc_fail_work);
+	INIT_DELAYED_WORK(&d->to_work, bbc_to_work);
+	init_usb_anchor(&d->anchor);
+	d->udev = usb_get_dev(interface_to_usbdev(intf));
+	d->intf = intf;
+	d->pipe_in = usb_rcvbulkpipe(d->udev, usb_endpoint_num(ein));
+	d->pipe_out = usb_sndbulkpipe(d->udev, usb_endpoint_num(eout));
+	d->rx_buf = kmalloc(BBC_BUFSZ, GFP_KERNEL);
+	d->rx_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!d->rx_buf || !d->rx_urb) {
+		ret = -ENOMEM;
+		goto err_put;
+	}
+
+	/* keep one reply urb posted at all times */
+	usb_fill_bulk_urb(d->rx_urb, d->udev, d->pipe_in, d->rx_buf, BBC_BUFSZ, bbc_rx_complete, d);
+	usb_anchor_urb(d->rx_urb, &d->anchor);
+	ret = usb_submit_urb(d->rx_urb, GFP_KERNEL);
+	if (ret) {
+		usb_unanchor_urb(d->rx_urb);
+		goto err_put;
+	}
+
+	/* is the daemon alive? also fetch its description */
+	o.data = d->info;
+	o.datacap = sizeof(d->info) - 1;
+	ret = bbc_xfer(d, BBC_OP_INFO, 0, 0, 0, NULL, 0, NULL, 0, NULL, 0, &o);
+	if (ret) {
+		dev_err(&intf->dev, "board did not answer INFO: %d\n", ret);
+		goto err_kill;
+	}
+	usb_set_intfdata(intf, d);
+	ret = device_create_file(&intf->dev, &dev_attr_stats);
+	if (ret)
+		goto err_data;
+	ret = device_create_file(&intf->dev, &dev_attr_ping);
+	if (ret)
+		goto err_stats;
+
+	mutex_lock(&bbc_algs_lock);
+	spin_lock_irqsave(&bbc_reg_lock, fl);
+	d->devid = ++bbc_next_devid;
+	list_add_tail(&d->node, &bbc_devs);
+	bbc_ndevs++;
+	spin_unlock_irqrestore(&bbc_reg_lock, fl);
+	if (!bbc_algs_up) {
+		ret = bbc_register_algs();
+		if (ret) {
+			spin_lock_irqsave(&bbc_reg_lock, fl);
+			list_del(&d->node);
+			bbc_ndevs--;
+			if (bbc_rr == d)
+				bbc_rr = NULL;
+			spin_unlock_irqrestore(&bbc_reg_lock, fl);
+			mutex_unlock(&bbc_algs_lock);
+			goto err_file;
+		}
+		bbc_algs_up = true;
+	}
+	mutex_unlock(&bbc_algs_lock);
+	dev_info(&intf->dev, "bbcrypto: board %u ready (priority %u, window %u); %s\n", d->devid,
+		 prio, win(), d->info);
+	return 0;
+
+err_file:
+	device_remove_file(&intf->dev, &dev_attr_ping);
+err_stats:
+	device_remove_file(&intf->dev, &dev_attr_stats);
+err_data:
+	usb_set_intfdata(intf, NULL);
+err_kill:
+	usb_kill_anchored_urbs(&d->anchor);
+err_put:
+	bbc_put(d);
+	return ret;
+}
