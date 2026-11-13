@@ -1472,3 +1472,194 @@ static int bbc_aead_decrypt(struct aead_request *req)
 {
 	return bbc_aead_crypt(req, true);
 }
+
+static struct bbc_aead bbc_aeads[] = {
+	{.alg = {.init = bbc_aead_init,
+		 .setkey = bbc_aead_setkey,
+		 .setauthsize = bbc_aead_setauthsize,
+		 .encrypt = bbc_aead_encrypt,
+		 .decrypt = bbc_aead_decrypt,
+		 .ivsize = GCM_AES_IV_SIZE,
+		 .maxauthsize = AES_BLOCK_SIZE,
+		 .base = {.cra_name = "gcm(aes)",
+			  .cra_driver_name = "gcm-aes-bbcrypto",
+			  .cra_blocksize = 1,
+			  .cra_flags = CRYPTO_ALG_ASYNC | CRYPTO_ALG_ALLOCATES_MEMORY,
+			  .cra_ctxsize = sizeof(struct bbc_aead_ctx),
+			  .cra_module = THIS_MODULE}}},
+};
+
+/* ------------------------------------------------------------------ */
+/* registration / USB glue                                             */
+/* ------------------------------------------------------------------ */
+
+static void bbc_unregister_algs(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(bbc_hashes); i++)
+		if (bbc_hashes[i].registered) {
+			crypto_unregister_shash(&bbc_hashes[i].alg);
+			bbc_hashes[i].registered = false;
+		}
+	for (i = 0; i < ARRAY_SIZE(bbc_ciphers); i++)
+		if (bbc_ciphers[i].registered) {
+			crypto_unregister_skcipher(&bbc_ciphers[i].alg);
+			bbc_ciphers[i].registered = false;
+		}
+	for (i = 0; i < ARRAY_SIZE(bbc_ahashes); i++)
+		if (bbc_ahashes[i].registered) {
+			crypto_unregister_ahash(&bbc_ahashes[i].alg);
+			bbc_ahashes[i].registered = false;
+		}
+	for (i = 0; i < ARRAY_SIZE(bbc_aeads); i++)
+		if (bbc_aeads[i].registered) {
+			crypto_unregister_aead(&bbc_aeads[i].alg);
+			bbc_aeads[i].registered = false;
+		}
+}
+
+static int bbc_register_algs(void)
+{
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(bbc_hashes); i++) {
+		bbc_hashes[i].alg.base.cra_priority = prio;
+		ret = crypto_register_shash(&bbc_hashes[i].alg);
+		if (ret)
+			goto err;
+		bbc_hashes[i].registered = true;
+	}
+	for (i = 0; i < ARRAY_SIZE(bbc_ciphers); i++) {
+		bbc_ciphers[i].alg.base.cra_priority = prio;
+		ret = crypto_register_skcipher(&bbc_ciphers[i].alg);
+		if (ret)
+			goto err;
+		bbc_ciphers[i].registered = true;
+	}
+	for (i = 0; i < ARRAY_SIZE(bbc_ahashes); i++) {
+		bbc_ahashes[i].alg.halg.base.cra_priority = prio;
+		ret = crypto_register_ahash(&bbc_ahashes[i].alg);
+		if (ret)
+			goto err;
+		bbc_ahashes[i].registered = true;
+	}
+	for (i = 0; i < ARRAY_SIZE(bbc_aeads); i++) {
+		bbc_aeads[i].alg.base.cra_priority = prio;
+		ret = crypto_register_aead(&bbc_aeads[i].alg);
+		if (ret)
+			goto err;
+		bbc_aeads[i].registered = true;
+	}
+	return 0;
+err:
+	bbc_unregister_algs();
+	return ret;
+}
+
+static ssize_t stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct bbc_dev *d = usb_get_intfdata(to_usb_interface(dev));
+	s64 req = atomic64_read(&d->n_req), err = atomic64_read(&d->n_err);
+	s64 lat = atomic64_read(&d->n_lat_us);
+	unsigned long fl;
+	unsigned int maxin, now;
+
+	spin_lock_irqsave(&d->lock, fl);
+	maxin = d->max_inflight;
+	now = d->n_inflight;
+	spin_unlock_irqrestore(&d->lock, fl);
+	return sysfs_emit(buf,
+			  "requests %lld\nbytes %lld\nerrors %lld\nretries %lld\n"
+			  "avg_latency_us %lld\ninflight %u\nmax_inflight %u\nboard: %s\n",
+			  req, atomic64_read(&d->n_bytes), err, atomic64_read(&d->n_retry),
+			  (req + err) ? lat / (req + err) : 0, now, maxin, d->info);
+}
+static DEVICE_ATTR_RO(stats);
+
+/*
+ * 'ping' benchmark: echoes <size> bytes off the board <count> times through the normal
+ * command engine (so the window applies) with no crypto involved. Separates the cost of the
+ * USB path and the board's daemon from the cost of the cipher itself.
+ *   echo "32768 200" > /sys/bus/usb/drivers/bbcrypto/<intf>/ping ; cat .../ping
+ */
+struct bbc_pbench {
+	struct bbc_dev *d;
+	u32 size;
+	atomic_t left;	  /* commands still to be submitted */
+	atomic_t pending; /* commands submitted and not yet completed */
+	int err;
+	struct completion comp;
+};
+
+static int bbc_pb_submit(struct bbc_pbench *pb);
+
+static void bbc_pb_done(struct bbc_cmd *c)
+{
+	struct bbc_pbench *pb = c->priv;
+
+	if (c->status && !pb->err)
+		pb->err = c->status;
+	if (!pb->err && atomic_dec_if_positive(&pb->left) >= 0)
+		bbc_pb_submit(pb);
+	if (atomic_dec_and_test(&pb->pending))
+		complete(&pb->comp);
+}
+
+static int bbc_pb_submit(struct bbc_pbench *pb)
+{
+	struct bbc_cmd *c;
+	u8 *dp;
+
+	c = bbc_cmd_new(pb->d, BBC_OP_PING, 0, 0, 0, NULL, 0, NULL, 0, pb->size,
+			sizeof(struct bbc_resp) + pb->size, &dp);
+	if (!c)
+		return -ENOMEM;
+	memset(dp, 0x5a, pb->size);
+	atomic_inc(&pb->pending);
+	bbc_cmd_submit(c, bbc_pb_done, pb);
+	return 0;
+}
+
+static ssize_t ping_store(struct device *dev, struct device_attribute *attr, const char *buf,
+			  size_t len)
+{
+	struct bbc_dev *d = usb_get_intfdata(to_usb_interface(dev));
+	struct bbc_pbench pb = {.d = d};
+	unsigned int size, count, i, prime;
+	ktime_t t0;
+	s64 us;
+
+	if (sscanf(buf, "%u %u", &size, &count) != 2 || !count || size > BBC_MAX_DATA)
+		return -EINVAL;
+	pb.size = size;
+	atomic_set(&pb.left, count);
+	atomic_set(&pb.pending, 0);
+	init_completion(&pb.comp);
+	kref_get(&d->ref);
+
+	t0 = ktime_get();
+	prime = min(count, 2 * win());
+	atomic_sub(prime, &pb.left);
+	atomic_inc(&pb.pending); /* guard: no completion until priming is done */
+	for (i = 0; i < prime; i++)
+		if (bbc_pb_submit(&pb)) {
+			pb.err = -ENOMEM;
+			break;
+		}
+	if (atomic_dec_and_test(&pb.pending))
+		complete(&pb.comp);
+	wait_for_completion(&pb.comp);
+	us = max_t(s64, ktime_us_delta(ktime_get(), t0), 1);
+	bbc_put(d);
+
+	if (pb.err)
+		snprintf(d->bench, sizeof(d->bench), "error %d\n", pb.err);
+	else
+		snprintf(d->bench, sizeof(d->bench),
+			 "size %u count %u window %u: %lld us total, %lld us per command, %lld "
+			 "KB/s each way\n",
+			 size, count, win(), us, div_s64(us, count),
+			 div64_s64((s64)size * count * 1000000, us * 1024));
+	return len;
+}
