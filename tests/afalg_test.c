@@ -499,3 +499,139 @@ static double conc_run(const char *alg, int hashing, int threads, int n, size_t 
 	}
 	return now() - t;
 }
+
+/* ---- unplug test: keep the device busy for a while, counting successes and failures ---- */
+static volatile int loop_stop;
+struct loopres {
+	long ok, bad;
+	int idx;
+};
+
+static long aead(const char *name, const uint8_t *key, unsigned kl, const uint8_t *iv, int dec,
+		 unsigned al, unsigned tag, const uint8_t *in, size_t n, uint8_t *out);
+static void *loop_thread(void *a)
+{
+	struct loopres *r = a;
+	uint8_t *d = malloc(65536), *o = malloc(65536), key[32] = {3}, iv[16] = {4}, dig[32];
+
+	memset(d, 0x11, 65536);
+	while (!loop_stop) {
+		int e;
+		switch (r->idx % 4) {
+		case 0:
+			e = hash("sha256-bbcrypto", NULL, 0, d, 64, 32, dig, 0);
+			break;
+		case 1:
+			e = cipher("ecb-aes-bbcrypto", key, 32, iv, 0, 0, d, 65536, o);
+			break;
+		case 2:
+			e = hash("sha256-async-bbcrypto", NULL, 0, d, 4096, 32, dig, 0);
+			break;
+		default:
+			e = aead("gcm-aes-bbcrypto", key, 32, iv, 0, 13, 16, d, 4096, o) < 0;
+			break;
+		}
+		if (e) {
+			r->bad++;
+			usleep(10000);
+		} else
+			r->ok++;
+	}
+	free(d);
+	free(o);
+	return NULL;
+}
+
+static int loop_mode(int secs)
+{
+	pthread_t th[4];
+	struct loopres r[4] = {{0}};
+	long ok = 0, bad = 0;
+
+	for (int i = 0; i < 4; i++) {
+		r[i].idx = i;
+		pthread_create(&th[i], NULL, loop_thread, &r[i]);
+	}
+	sleep(secs);
+	loop_stop = 1;
+	for (int i = 0; i < 4; i++) {
+		pthread_join(th[i], NULL);
+		ok += r[i].ok;
+		bad += r[i].bad;
+	}
+	printf("LOOP ok=%ld failed=%ld\n", ok, bad);
+	return 0;
+}
+
+static int sweep(void)
+{
+	static const unsigned wins[] = {1, 2, 4, 8}, chunks[] = {4096, 16384, 32768};
+	static const unsigned psz[] = {64, 1024, 4096, 16384, 32768};
+	size_t n = 2 << 20;
+	uint8_t *d = malloc(n), *o = malloc(n), key[32] = {1}, iv[16] = {2};
+	char line[200];
+	int bad;
+
+	rnd(d, n);
+	printf("== A. transport only: echo off the board, no crypto (driver 'ping' attribute)\n");
+	for (unsigned s = 0; s < sizeof(psz) / sizeof(*psz); s++)
+		for (unsigned w = 0; w < sizeof(wins) / sizeof(*wins); w++) {
+			unsigned cnt = (8u << 20) / psz[s];
+			if (cnt < 100)
+				cnt = 100;
+			if (cnt > 2000)
+				cnt = 2000;
+			setp("window", wins[w]);
+			ping_run(psz[s], cnt, line, sizeof(line));
+			printf("PING %s", line[0] ? line : "(failed)\n");
+		}
+
+	printf("== B. AES-ECB 2 MiB through AF_ALG, one caller: window x chunk size\n");
+	for (unsigned w = 0; w < sizeof(wins) / sizeof(*wins); w++)
+		for (unsigned c = 0; c < sizeof(chunks) / sizeof(*chunks); c++) {
+			double t;
+			int r;
+			setp("window", wins[w]);
+			setp("chunk", chunks[c]);
+			t = now();
+			r = cipher("ecb-aes-bbcrypto", key, 32, iv, 0, 0, d, n, o);
+			t = now() - t;
+			printf("ECB window=%u chunk=%-5u : %6.2f MB/s  (%.3f s, r=%d)\n", wins[w],
+			       chunks[c], 2 / t, t, r);
+		}
+	{
+		double t;
+		int r;
+		setp("window", 4);
+		setp("chunk", 16384);
+		t = now();
+		r = cipher("cbc-aes-bbcrypto", key, 32, iv, 16, 0, d, n, o);
+		t = now() - t;
+		printf("CBC encrypt (serial chain) window=4 chunk=16384 : %6.2f MB/s  (r=%d)\n",
+		       2 / t, r);
+		memcpy(d, o, n);
+		t = now();
+		r = cipher("cbc-aes-bbcrypto", key, 32, iv, 16, 1, d, n, o);
+		t = now() - t;
+		printf("CBC decrypt (parallel chunks) window=4 chunk=16384 : %6.2f MB/s  (r=%d)\n",
+		       2 / t, r);
+	}
+
+	printf("== C. concurrent callers (each thread does its own requests)\n");
+	for (unsigned w = 0; w < 3; w++) {
+		static const unsigned ww[] = {1, 4, 8};
+		setp("window", ww[w]);
+		setp("chunk", 16384);
+		for (int th = 1; th <= 8; th *= 2) {
+			double t = conc_run("sha256-bbcrypto", 1, th, 150, 64, &bad);
+			double t2 = conc_run("ecb-aes-bbcrypto", 0, th, 12, 65536, &bad);
+			printf("CONC window=%u threads=%d : sha256(64B) %7.0f req/s   "
+			       "ecb-aes(64KiB) %5.2f MB/s%s\n",
+			       ww[w], th, th * 150 / t, th * 12 * 64.0 / 1024 / t2,
+			       bad ? "  ERRORS" : "");
+		}
+	}
+	setp("window", 4);
+	setp("chunk", 16384);
+	return 0;
+}
