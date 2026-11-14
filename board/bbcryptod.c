@@ -993,3 +993,162 @@ static void serve(int in_fd, int out_fd)
 	}
 	rx_stop();
 }
+
+/* ------------------------------ FunctionFS setup ------------------------------ */
+
+#define LE32(x) htole32(x)
+#define LE16(x) htole16(x)
+
+static const struct {
+	struct usb_functionfs_descs_head_v2 hdr;
+	__le32 fs_count, hs_count;
+	struct {
+		struct usb_interface_descriptor intf;
+		struct usb_endpoint_descriptor_no_audio out, in;
+	} __attribute__((packed)) fs, hs;
+} __attribute__((packed)) descs = {
+	.hdr = {.magic = LE32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
+		.length = LE32(sizeof(descs)),
+		.flags = LE32(FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC)},
+	.fs_count = LE32(3),
+	.hs_count = LE32(3),
+#define INTF                                                                                       \
+	{.bLength = sizeof(struct usb_interface_descriptor),                                       \
+	 .bDescriptorType = USB_DT_INTERFACE,                                                      \
+	 .bNumEndpoints = 2,                                                                       \
+	 .bInterfaceClass = BBC_USB_CLASS,                                                         \
+	 .bInterfaceSubClass = BBC_USB_SUBCLASS,                                                   \
+	 .bInterfaceProtocol = BBC_USB_PROTO,                                                      \
+	 .iInterface = 1}
+#define EP(a, mps)                                                                                 \
+	{.bLength = USB_DT_ENDPOINT_SIZE,                                                          \
+	 .bDescriptorType = USB_DT_ENDPOINT,                                                       \
+	 .bEndpointAddress = (a),                                                                  \
+	 .bmAttributes = USB_ENDPOINT_XFER_BULK,                                                   \
+	 .wMaxPacketSize = LE16(mps)}
+	.fs = {INTF, EP(1 | USB_DIR_OUT, 64), EP(2 | USB_DIR_IN, 64)},
+	.hs = {INTF, EP(1 | USB_DIR_OUT, 512), EP(2 | USB_DIR_IN, 512)},
+};
+
+static const struct {
+	struct usb_functionfs_strings_head hdr;
+	__le16 lang;
+	char str[15];
+} __attribute__((packed)) strs = {
+	.hdr = {.magic = LE32(FUNCTIONFS_STRINGS_MAGIC),
+		.length = LE32(sizeof(strs)),
+		.str_count = LE32(1),
+		.lang_count = LE32(1)},
+	.lang = LE16(0x0409),
+	.str = "bbcrypto accel",
+};
+
+struct eps {
+	int in, out;
+};
+
+static int w_in = -1, w_out = -1;
+
+static void worker_cleanup(void *arg)
+{
+	(void)arg;
+	rx_stop();
+	if (w_in >= 0)
+		close(w_in);
+	if (w_out >= 0)
+		close(w_out);
+	w_in = w_out = -1;
+	fprintf(stderr, "worker done\n");
+}
+
+static void *worker(void *arg)
+{
+	char p[256];
+	int in, out;
+
+	(void)arg;
+	pthread_cleanup_push(worker_cleanup, NULL);
+	snprintf(p, sizeof(p), "%s/ep1", ffs_dir);
+	in = open(p, O_RDWR);
+	snprintf(p, sizeof(p), "%s/ep2", ffs_dir);
+	out = open(p, O_RDWR);
+	w_in = in;
+	w_out = out;
+	if (in < 0 || out < 0)
+		perror("open eps");
+	else {
+		fprintf(stderr, "host connected, serving\n");
+		serve(in, out);
+	}
+	pthread_cleanup_pop(1);
+	return NULL;
+}
+
+int main(int argc, char **argv)
+{
+	char p[256];
+	int ep0;
+	pthread_t th;
+	int running = 0;
+
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "-v"))
+			verbose = 1;
+		else
+			ffs_dir = argv[i];
+	}
+	build_info();
+	snprintf(p, sizeof(p), "%s/ep0", ffs_dir);
+	ep0 = open(p, O_RDWR);
+	if (ep0 < 0) {
+		perror(p);
+		return 1;
+	}
+	if (write(ep0, &descs, sizeof(descs)) != sizeof(descs) ||
+	    write(ep0, &strs, sizeof(strs)) != sizeof(strs)) {
+		perror("write descriptors/strings");
+		return 1;
+	}
+	fprintf(stderr, "%s\n", info);
+	for (;;) {
+		struct usb_functionfs_event ev;
+		ssize_t n = read(ep0, &ev, sizeof(ev));
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("ep0");
+			return 1;
+		}
+		if (n != sizeof(ev))
+			continue;
+		if (verbose)
+			fprintf(stderr, "ep0 event %d\n", ev.type);
+		switch (ev.type) {
+		case FUNCTIONFS_ENABLE:
+			if (running) {
+				pthread_cancel(th);
+				pthread_join(th, NULL);
+			}
+			pthread_create(&th, NULL, worker, NULL);
+			running = 1;
+			break;
+		case FUNCTIONFS_DISABLE:
+			if (running) {
+				pthread_cancel(th);
+				pthread_join(th, NULL);
+				running = 0;
+			}
+			break;
+		case FUNCTIONFS_SETUP:
+			/* not expecting class/vendor control requests: stall */
+			if (ev.u.setup.bRequestType & USB_DIR_IN)
+				(void)read(ep0, NULL, 0);
+			else
+				(void)write(ep0, NULL, 0);
+			break;
+		default:
+			break;
+		}
+	}
+}
