@@ -1774,3 +1774,80 @@ err_put:
 	bbc_put(d);
 	return ret;
 }
+
+static void bbc_disconnect(struct usb_interface *intf)
+{
+	struct bbc_dev *d = usb_get_intfdata(intf);
+	unsigned long fl;
+
+	/* no new work can pick this board any more */
+	mutex_lock(&bbc_algs_lock);
+	spin_lock_irqsave(&bbc_reg_lock, fl);
+	list_del(&d->node);
+	bbc_ndevs--;
+	if (bbc_rr == d)
+		bbc_rr = NULL;
+	spin_unlock_irqrestore(&bbc_reg_lock, fl);
+	/*
+	 * The algorithms deliberately stay registered: user space may still hold transforms
+	 * (an open AF_ALG socket), and the crypto core warns if an algorithm is unregistered
+	 * while it has users. They go away at module unload, which cannot happen while a
+	 * transform exists. Until a board returns, requests fail with -ENODEV.
+	 */
+	mutex_unlock(&bbc_algs_lock);
+
+	/* stop the wire, then fail whatever was still pending */
+	spin_lock_irqsave(&d->lock, fl);
+	d->dead = true;
+	spin_unlock_irqrestore(&d->lock, fl);
+	usb_kill_anchored_urbs(&d->anchor);
+	if (cancel_delayed_work_sync(&d->to_work))
+		bbc_put(d);
+	bbc_kick(d, &d->fail_work);
+	flush_work(&d->fail_work);
+
+	device_remove_file(&intf->dev, &dev_attr_ping);
+	device_remove_file(&intf->dev, &dev_attr_stats);
+	usb_set_intfdata(intf, NULL);
+	bbc_put(d);
+}
+
+static const struct usb_device_id bbc_ids[] = {
+	{USB_DEVICE_AND_INTERFACE_INFO(0x1d6b, 0x0104, BBC_USB_CLASS, BBC_USB_SUBCLASS,
+				       BBC_USB_PROTO)},
+	{}};
+MODULE_DEVICE_TABLE(usb, bbc_ids);
+
+static struct usb_driver bbc_driver = {
+	.name = DRV,
+	.probe = bbc_probe,
+	.disconnect = bbc_disconnect,
+	.id_table = bbc_ids,
+};
+
+static int __init bbc_init(void)
+{
+	int ret;
+
+	bbc_wq = alloc_ordered_workqueue("bbcrypto", WQ_MEM_RECLAIM);
+	if (!bbc_wq)
+		return -ENOMEM;
+	ret = usb_register(&bbc_driver);
+	if (ret)
+		destroy_workqueue(bbc_wq);
+	return ret;
+}
+
+static void __exit bbc_exit(void)
+{
+	usb_deregister(&bbc_driver);
+	bbc_unregister_algs();
+	destroy_workqueue(bbc_wq);
+}
+
+module_init(bbc_init);
+module_exit(bbc_exit);
+
+MODULE_DESCRIPTION("USB crypto accelerator (BeagleBone Black) for the kernel crypto API");
+MODULE_AUTHOR("Advanced OS project");
+MODULE_LICENSE("GPL");
