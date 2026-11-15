@@ -12,3 +12,21 @@
 #   make install-board   copy bbcryptod + OpenRC services to the board and restart them
 KDIR     ?= /lib/modules/$(shell uname -r)/build    # kernel build tree to compile the module against
 CLANG    ?= clang
+
+all: host tests board
+build: all
+
+CSRC := tests/afalg_extra.h host/bbcrypto.c board/bbcryptod.c tests/afalg_test.c tools/bbcrypt.c tools/board_aes.c demos/6_hash.c proto.h
+SH   := $(wildcard scripts/*.sh board/*.sh board/*.openrc demos/*.sh)
+setup:
+	git config core.hooksPath .githooks
+format:
+	clang-format -i $(CSRC)
+lint:
+	clang-format --dry-run -Werror $(CSRC)
+	pyflakes demos/*.py
+	for f in $(SH); do bash -n $$f || exit 1; done
+typecheck:
+	for f in tests/afalg_test.c tools/bbcrypt.c tools/board_aes.c demos/6_hash.c; do \
+	  $(CC) -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Werror -fsyntax-only -I. $$f || exit 1; done
+	python3 -m py_compile demos/*.py
