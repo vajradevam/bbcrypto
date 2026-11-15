@@ -635,3 +635,122 @@ static int sweep(void)
 	setp("chunk", 16384);
 	return 0;
 }
+
+#include "afalg_extra.h"
+
+int main(int argc, char **argv)
+{
+	static const size_t hl[] = {0, 1, 55, 56, 63, 64, 65, 1000, 32768, 32769, 100000, 1 << 20};
+	static const size_t cl[] = {16, 32, 48, 160, 4096, 32768, 32784, 100000 / 16 * 16, 1 << 20};
+	static const size_t ctrl[] = {1, 15, 16, 17, 33, 1000, 32769, 100001};
+	double t0;
+
+	srand(1234);
+	if (argc > 1 && !strcmp(argv[1], "bench")) {
+		static const struct {
+			const char *n;
+			int hash;
+			const char *name;
+		} T[] = {{"sha256", 1, "sha256-bbcrypto"},   {"sha256 (local)", 1, "sha256"},
+			 {"ecb-aes", 0, "ecb-aes-bbcrypto"}, {"cbc-aes", 0, "cbc-aes-bbcrypto"},
+			 {"ctr-aes", 0, "ctr-aes-bbcrypto"}, {"cbc-aes (local)", 0, "cbc(aes)"}};
+		size_t n = 1 << 20;
+		uint8_t *d = malloc(n), *o = malloc(n), key[32] = {1}, iv[16] = {2}, dig[32];
+		rnd(d, n);
+		for (unsigned i = 0; i < sizeof(T) / sizeof(*T); i++) {
+			double t = now();
+			int r;
+			if (T[i].hash)
+				r = hash(T[i].name, NULL, 0, d, n, 32, dig, 0);
+			else
+				r = cipher(T[i].name, key, 32, iv, T[i].name[0] == 'e' ? 0 : 16, 0,
+					   d, n, o);
+			t = now() - t;
+			printf("BENCH %-16s 1 MiB: %7.3f s  = %6.2f MB/s  (r=%d)\n", T[i].n, t,
+			       1 / t, r);
+		}
+		{
+			double t = now();
+			uint8_t x[32];
+			for (int i = 0; i < 200; i++)
+				hash("sha256-bbcrypto", NULL, 0, d, 64, 32, x, 0);
+			printf("BENCH small-request latency: %.2f ms per 64-byte sha256\n",
+			       (now() - t) * 1000 / 200);
+		}
+		return 0;
+	}
+	if (argc > 2 && !strcmp(argv[1], "loop"))
+		return loop_mode(atoi(argv[2]));
+	if (argc > 1 && !strcmp(argv[1], "unplug"))
+		return unplug_mode();
+	if (argc > 1 && !strcmp(argv[1], "sweep"))
+		return sweep();
+	if (argc > 1 && !strcmp(argv[1], "stress")) { /* many streamed hashes of odd sizes */
+		int bad = 0, n = argc > 2 ? atoi(argv[2]) : 200;
+		uint8_t *d = malloc(200000), a[32], b[32];
+		rnd(d, 200000);
+		for (int i = 0; i < n; i++) {
+			size_t len = 1 + rand() % 70000,
+			       piece = 1 + rand() % (argc > 3 ? atoi(argv[3]) : 1500);
+			int r1 = hash("sha256", NULL, 0, d, len, 32, a, 0);
+			int r2 = hash("sha256-bbcrypto", NULL, 0, d, len, 32, b, piece);
+			if (r1 || r2 || memcmp(a, b, 32)) {
+				bad++;
+				printf("FAIL stress #%d len=%zu piece=%zu\n", i, len, piece);
+			}
+		}
+		printf("stress: %d/%d bad\n", bad, n);
+		return bad != 0;
+	}
+	srand(1234);
+	if (find_reference()) {
+		printf("FAIL no independent software AES reference found\n");
+		return 1;
+	}
+	vectors();
+	t_hash("sha256", "sha256-bbcrypto", 32, 0, hl, sizeof(hl) / sizeof(*hl));
+	t_hash("sha1", "sha1-bbcrypto", 20, 0, hl, sizeof(hl) / sizeof(*hl));
+	for (unsigned kl = 5; kl <= 128; kl = kl < 64 ? 64 : kl == 64 ? 100 : 128 + 1)
+		t_hash("hmac(sha256)", "hmac-sha256-bbcrypto", 32, kl, hl, 8);
+	/* the asynchronous ahash flavours of the same hashes */
+	t_hash("sha256", "sha256-async-bbcrypto", 32, 0, hl, sizeof(hl) / sizeof(*hl));
+	t_hash("sha1", "sha1-async-bbcrypto", 20, 0, hl, sizeof(hl) / sizeof(*hl));
+	for (unsigned kl = 5; kl <= 128; kl = kl < 64 ? 64 : kl == 64 ? 100 : 128 + 1)
+		t_hash("hmac(sha256)", "hmac-sha256-async-bbcrypto", 32, kl, hl, 8);
+	if (find_gcm_reference(aes_inner_name))
+		printf("FAIL no software GCM reference\n"), fails++;
+	else
+		t_gcm();
+	t_vectors2();
+	t_errors();
+	t_registered();
+	t_sysfs();
+	if (!find_gcm_reference(aes_inner_name)) {
+		t_params();
+		t_mixed();
+	}
+	for (unsigned kl = 16; kl <= 32; kl += 8) {
+		t_cipher(refname[0], "ecb-aes-bbcrypto", kl, 0, cl, sizeof(cl) / sizeof(*cl));
+		t_cipher(refname[1], "cbc-aes-bbcrypto", kl, 16, cl, sizeof(cl) / sizeof(*cl));
+		t_cipher(refname[2], "ctr-aes-bbcrypto", kl, 16, ctrl,
+			 sizeof(ctrl) / sizeof(*ctrl));
+		t_cipher(refname[2], "ctr-aes-bbcrypto", kl, 16, cl, sizeof(cl) / sizeof(*cl));
+	}
+
+	{ /* throughput: 16 MiB of SHA-256 and AES-CBC through the board */
+		size_t n = 16 << 20;
+		uint8_t *d = malloc(n), *o = malloc(n), key[32] = {1}, iv[16] = {2}, dig[32];
+		rnd(d, n);
+		t0 = now();
+		hash("sha256-bbcrypto", NULL, 0, d, n, 32, dig, 1 << 20);
+		printf("INFO sha256 via board: %.2f MB/s\n", 16 / (now() - t0));
+		t0 = now();
+		hash("sha256", NULL, 0, d, n, 32, dig, 1 << 20);
+		printf("INFO sha256 local     : %.2f MB/s\n", 16 / (now() - t0));
+		t0 = now();
+		cipher("cbc-aes-bbcrypto", key, 32, iv, 16, 0, d, n, o);
+		printf("INFO cbc-aes via board: %.2f MB/s\n", 16 / (now() - t0));
+	}
+	printf("\n%d passed, %d failed\n", passes, fails);
+	return fails != 0;
+}
