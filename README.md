@@ -63,3 +63,54 @@ scripts/           deploy-host.sh, deploy-kernel.sh (other machines), fetch-sysr
 docs/ARCHITECTURE.md   how it works, file map
 build/             generated, git-ignored: Alpine sysroot (and any kernel trees from deploy-kernel.sh)
 ```
+
+## Exact steps
+
+**0. What you need.** A BeagleBone Black whose kernel has the options in `board/kernel.config` (the ones that
+matter: `CRYPTO_DEV_OMAP_AES`, `CRYPTO_DEV_OMAP_SHA`, USB gadget with configfs + FunctionFS, MUSB) and an
+OpenRC userland (we use Alpine 3.24) reachable as `root@192.168.7.2` (`scripts/bbb-net-up.sh` gives the PC side of
+that link its address). On the PC: gcc, make, clang + lld, curl, and kernel headers for whatever kernel you
+load the module into.
+
+**1. Build everything and put the daemon on the board** (the PC is not modified):
+
+```
+make                 # module, tests, and the armv7 daemon (downloads an Alpine musl sysroot to build/)
+make install-board   # BOARD=192.168.7.2 BOARD_PASS=...: daemon + OpenRC services; originals are kept on the board
+```
+
+**2. Install and test on the machine the board is plugged into** (Linux, headers installed):
+
+```
+make deploy HOST=user@machine        # builds against that machine's running kernel, installs, loads, tests
+make lint typecheck                 # static checks, no hardware needed (see CONTRIBUTING.md, docs/STANDARD.md)
+```
+
+If that machine's kernel has no headers or no AF_ALG AEAD, `scripts/deploy-kernel.sh user@machine build|install`
+first builds and installs a matching kernel as an extra, one-shot boot entry (see the end of this file).
+
+**3. Use it:** `bbcrypt hash sha256 file`, `bbcrypt gcm-enc ...` (`-b` = same thing in the kernel, to compare), or
+any program through AF_ALG by driver name. `insmod bbcrypto.ko prio=400` makes ordinary `sha256`/`aes` requests
+use the board. Throughput is about 2.8 MB/s: this is an OS/driver project, not a speed-up.
+
+Everything is rebuilt from a clean checkout; the daemon binary comes out identical to the one on the board.
+
+## Running it
+Board: install `board/bbcrypto.openrc` as `/etc/init.d/bbcrypto` and `rc-update add bbcrypto default`; it runs
+after the `usbgadget` service and before networking/sshd, so the interface is added at every boot.
+Manual control: `rc-service bbcrypto start|stop|restart` (stop unbinds the USB gadget before killing the
+daemon; run it detached, the link drops briefly). `setup-gadget.sh` is the older manual equivalent.
+Cross-build the daemon: `SYSROOT=<alpine armv7 musl-dev root> board/build.sh`. Module parameters: `prio`, `window` (1..8), `chunk`
+(multiple of 16, up to 32768); `window` and `chunk` can be changed at run time.
+
+## Hardware quirks found (all handled)
+- AM335x MUSB can drop the first packet of an OUT transfer if no read is queued at that moment. A thread
+  looping on `read()` always leaves a gap, which is invisible when the host sends one request at a
+  time but constant when requests are pipelined (measured: 59 retries and 0.05 MB/s). The daemon
+  therefore queues 12 reads on the endpoint at all times with kernel AIO; a harvester thread reassembles
+  split requests and drops pad bytes.
+- Rarely a request is dropped without a trace: handled by the retry + reply cache above.
+- On 32-bit ARM `io_getevents` takes the old 32-bit timespec even under musl's 64-bit one; passing the
+  wrong layout turned a 100 ms wait into a busy loop.
+- Never kill `bbcryptod` while the gadget is bound (hung the board's kernel twice): use `setup-gadget.sh`,
+  which unbinds the UDC first.
