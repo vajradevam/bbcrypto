@@ -30,3 +30,24 @@ typecheck:
 	for f in tests/afalg_test.c tools/bbcrypt.c tools/board_aes.c demos/6_hash.c; do \
 	  $(CC) -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Werror -fsyntax-only -I. $$f || exit 1; done
 	python3 -m py_compile demos/*.py
+
+host:
+	$(MAKE) -C host KDIR=$(KDIR)
+tests: tests/afalg_test tools/bbcrypt
+tests/%: tests/%.c tests/afalg_extra.h
+	$(CC) -O2 -Wall -static -o $@ $< -lpthread
+tools/bbcrypt: tools/bbcrypt.c
+	$(CC) -O2 -Wall -static -o $@ $< -lpthread
+board: build/sysroot/usr/lib/crt1.o
+	cd board && SYSROOT=$(abspath build/sysroot) ./build.sh
+build/sysroot/usr/lib/crt1.o:
+	scripts/fetch-sysroot.sh
+install-board: board
+	board/install.sh
+deploy:
+	scripts/deploy-host.sh $(HOST)
+clean:
+	$(MAKE) -C host KDIR=$(KDIR) clean
+	rm -f tests/afalg_test tools/bbcrypt tools/board_aes board/bbcryptod demos/6_hash
+	rm -rf demos/__pycache__
+.PHONY: all build setup format lint typecheck host tests board install-board deploy clean
