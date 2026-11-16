@@ -1,0 +1,12 @@
+# Static checks and builds only: the functional suite needs the BeagleBone (make deploy / make test).
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang clang-format pyflakes3 linux-headers-generic
+      - run: make lint typecheck
+      - run: make tests
+      - run: make -C host KDIR=$(ls -d /lib/modules/*/build | tail -1)
