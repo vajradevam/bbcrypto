@@ -62,3 +62,34 @@ AF_ALG helpers, hash sessions (for the streaming hash ops), per-op handlers (`do
 hardware `ecb`/`ctr(aes)` + software GHASH), then the serving loop: kernel-AIO reads kept queued
 at all times (the AM335x MUSB can drop a packet that arrives with no read queued), a reply cache
 for retried tags, a writer thread, and FunctionFS setup in `main`.
+
+## Request life cycle (example: `sha256` through AF_ALG with `prio=400`)
+
+1. The caller asks for `sha256`; the crypto API picks `sha256-bbcrypto` (priority 400).
+2. The module builds a `bbc_cmd` with a fresh tag and queues it; up to `window` are on the wire.
+3. The OUT urb carries `bbc_req + key + iv + data`; the board reads it, runs the op via AF_ALG on
+   the hardware engine, caches the reply under the tag, and writes `bbc_resp + data` on the IN endpoint.
+4. The IN urb completes; the tag finds the command; the worker completes the crypto request.
+5. Reply late or lost → resend (up to 4 times) → then the request fails with an error.
+
+## Build and run
+
+| Goal | Command |
+|---|---|
+| Module + tests + board daemon | `make` |
+| Only the module, against any kernel tree | `make -C host KDIR=/path/to/kernel/build` |
+| Full test against the real board | `make deploy HOST=user@machine` on the machine the board is plugged into |
+| Put the daemon + services on the board | `make install-board` |
+| Install on another machine over ssh | `make deploy HOST=user@machine` (`SUDO_PASS=...` if needed) |
+| That machine has no headers or no AF_ALG AEAD | `scripts/deploy-kernel.sh user@machine build`, then `install`, reboot, then `make deploy` |
+
+Prerequisites: a C compiler and kernel build tree on the host side; `clang` + `lld` for the board
+daemon (cross-built against an Alpine armv7 sysroot fetched by `scripts/fetch-sysroot.sh`).
+The module is unsigned (disable Secure Boot or sign it).
+
+## Limits worth knowing
+
+- 32 KiB payload per command; the module chunks bigger requests (cipher/hash), GCM requests are capped at 32 KiB.
+- Board throughput is about 2.8 MB/s (USB 2.0 full round-trip), far below software AES-NI/SHA on a PC: this is a
+  design/OS project, not a speed-up.
+- Never kill `bbcryptod` while the gadget is bound; use `setup-gadget.sh` or `rc-service bbcrypto restart` (detached).
