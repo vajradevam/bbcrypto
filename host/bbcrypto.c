@@ -5,7 +5,7 @@
  * Binds to a vendor-specific interface exported by a BeagleBone Black running
  * bbcryptod and registers SHA-1, SHA-256, HMAC-SHA256 (shash and async ahash),
  * ECB/CBC/CTR-AES (async skcipher) and GCM-AES (async AEAD) with the kernel crypto API.
- * Overview and file map: ../docs/ARCHITECTURE.md. Every operation is shipped over a USB bulk pipe
+ * Every operation is shipped over a USB bulk pipe
  * to the board and executed there (on the AM335x SHA/AES engines when the board kernel exposes
  * them). User space reaches the algorithms through AF_ALG by driver name, e.g.
  * "sha256-bbcrypto" or "cbc-aes-bbcrypto".

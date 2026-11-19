@@ -52,8 +52,8 @@ fi
 O="-o ControlMaster=auto -o ControlPath=/tmp/bbc-%C -o ControlPersist=60 $SSH_OPTS"
 # the target gets a mirror of this repo in ~/bbcrypto (sources only; its build/ holds the kernel from deploy-kernel.sh and is kept).
 # The previous copy of each directory is kept in ~/bbcrypto/.prev, so edits made on the target are not lost by one deploy.
-tar czf - --exclude=./build --exclude=./.git --exclude='*.o' --exclude='*.ko' --exclude='*.mod*' \
+tar czf - --exclude=./build --exclude=./report --exclude=./.git --exclude='*.o' --exclude='*.ko' --exclude='*.mod*' \
   --exclude=Module.symvers --exclude=modules.order --exclude=board/bbcryptod --exclude=tests/afalg_test \
   --exclude=tools/bbcrypt --exclude=tools/board_aes --exclude=demos/6_hash . |
-  ssh $O "$TARGET" 'mkdir -p bbcrypto && cd bbcrypto && rm -rf .prev && mkdir .prev && for d in host board tests tools demos scripts docs; do [ -e $d ] && mv $d .prev/; done; tar xzf -'
+  ssh $O "$TARGET" 'mkdir -p bbcrypto && cd bbcrypto && rm -rf .prev && mkdir .prev && for d in host board tests tools demos scripts; do [ -e $d ] && mv $d .prev/; done; tar xzf -'
 payload | ssh $O "$TARGET" 'bash -s'
