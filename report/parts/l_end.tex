@@ -1,0 +1,41 @@
+\chapter*{Glossary}\addcontentsline{toc}{chapter}{Glossary}
+
+\begin{description}
+  \item[AEAD] authenticated encryption with associated data. GCM is an AEAD mode.
+  \item[AF\_ALG] the socket family through which user programs reach the kernel crypto API.
+  \item[AIO] the kernel's asynchronous I/O interface. The daemon uses it to keep reads queued.
+  \item[Anchor] a USB core object that groups the URBs of a device so they can be cancelled together.
+  \item[Bulk transfer] USB transfer type for large, loss-free data without timing guarantees.
+  \item[Completion] a kernel object a thread can sleep on until another context signals it.
+  \item[ConfigFS] a file system through which user space creates kernel objects, used here to build gadgets.
+  \item[Endpoint] one data pipe of a USB interface.
+  \item[FunctionFS] a gadget function implemented in user space through files for each endpoint.
+  \item[Gadget] a USB device implemented by a Linux system.
+  \item[GCM] Galois/Counter Mode, an AEAD mode for block ciphers.
+  \item[GHASH] the polynomial hash over $GF(2^{128})$ used by GCM for authentication.
+  \item[Interface] one function of a USB device. Drivers bind to interfaces.
+  \item[kbuild] the kernel's build system for modules.
+  \item[kref] kernel reference counter.
+  \item[MUSB] the USB controller design used in the AM335x.
+  \item[Probe] the driver function called when a matching device appears.
+  \item[Scatterlist] a list of memory fragments that together form one logical buffer.
+  \item[Spinlock] a lock that busy waits, usable in interrupt context.
+  \item[Tag (protocol)] a number that identifies a command so a reply can be matched to it.
+  \item[Transform] a crypto API object that holds an algorithm and its key.
+  \item[UDC] USB device controller, the hardware that makes a board act as a device.
+  \item[URB] USB request block, the unit of USB I/O in the kernel.
+  \item[Window] the maximum number of commands in flight at once.
+  \item[Workqueue] a kernel facility that runs functions later in process context.
+\end{description}
+
+\begin{thebibliography}{99}
+\bibitem{ldd3} J.~Corbet, A.~Rubini, G.~Kroah-Hartman, \emph{Linux Device Drivers}, 3rd ed., O'Reilly, 2005.
+\bibitem{kdocs} The Linux kernel documentation, \url{https://docs.kernel.org}, in particular the sections on the driver API, USB, the crypto API and gadget FunctionFS.
+\bibitem{usb2} Universal Serial Bus Specification, Revision 2.0, USB Implementers Forum, 2000.
+\bibitem{fips180} NIST, FIPS PUB 180-4, \emph{Secure Hash Standard}, 2015.
+\bibitem{fips197} NIST, FIPS PUB 197, \emph{Advanced Encryption Standard}, 2001.
+\bibitem{sp80038a} NIST, SP 800-38A, \emph{Recommendation for Block Cipher Modes of Operation}, 2001.
+\bibitem{sp80038d} NIST, SP 800-38D, \emph{Recommendation for Block Cipher Modes of Operation: Galois/Counter Mode (GCM) and GMAC}, 2007.
+\bibitem{rfc2104} H.~Krawczyk, M.~Bellare, R.~Canetti, RFC 2104, \emph{HMAC: Keyed-Hashing for Message Authentication}, 1997.
+\bibitem{am335x} Texas Instruments, \emph{AM335x Sitara Processors Technical Reference Manual}.
+\end{thebibliography}

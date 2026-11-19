@@ -1,0 +1,136 @@
+\section{A minimal character driver for comparison}\label{sec:minchar}
+
+Before the project's driver it helps to see the smallest useful driver, so that the pieces added later are recognisable. The listing below is illustrative and is not part of the project. It registers a character device that returns a fixed string.
+
+\begin{lstlisting}
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/miscdevice.h>
+#include <linux/uaccess.h>
+
+static ssize_t hello_read(struct file *f, char __user *buf,
+			  size_t len, loff_t *pos)
+{
+	static const char msg[] = "hello\n";
+
+	return simple_read_from_buffer(buf, len, pos, msg, sizeof(msg) - 1);
+}
+
+static const struct file_operations hello_fops = {
+	.owner = THIS_MODULE,
+	.read  = hello_read,
+};
+
+static struct miscdevice hello_dev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name  = "hello",
+	.fops  = &hello_fops,
+};
+
+module_misc_device(hello_dev);
+MODULE_LICENSE("GPL");
+\end{lstlisting}
+
+Three things are visible even here. The driver fills a table of function pointers (\code{file\_operations}) that the kernel calls on behalf of user programs. It copies data across the privilege boundary with a dedicated helper (\code{simple\_read\_from\_buffer} uses \code{copy\_to\_user}), because a user pointer cannot be dereferenced directly. And it registers with a subsystem (here the misc device class) instead of creating device nodes by hand.
+
+The \proj{} driver follows the same shape, with a bigger interface table: instead of \code{file\_operations} it fills \code{usb\_driver} for the bus side and \code{skcipher\_alg}, \code{shash\_alg}, \code{ahash\_alg} and \code{aead\_alg} for the crypto side.
+
+\section{Interrupts and deferred work}
+
+Hardware signals the processor with an \emph{interrupt}. The processor stops what it was doing, runs the registered \emph{interrupt handler}, and returns. Because every other activity on that processor waits while the handler runs, handlers must be short. The kernel splits interrupt work into two halves.
+
+\begin{description}
+  \item[Top half] runs immediately in interrupt context. It acknowledges the hardware, reads what it needs to, and schedules the rest.
+  \item[Bottom half] runs later with interrupts enabled. The kernel offers several mechanisms: softirqs and tasklets (still atomic context, cannot sleep) and \emph{workqueues} (process context, can sleep).
+\end{description}
+
+A USB driver does not usually see a hardware interrupt. The host controller driver handles that, and calls the driver's URB completion function. That function runs in softirq context, so it is the driver's top half in practice. The project's completion handlers follow the rule strictly. They take a spinlock, move a command between lists, and queue a work item. The slow part (calling back into the crypto layer, copying data, building new commands) happens on the workqueue.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+Context & May do & May not do \\
+\midrule
+Process (workqueue, system call) & sleep, \code{GFP\_KERNEL}, take mutexes, wait on a completion & nothing special \\
+Softirq / URB completion & spinlocks, \code{GFP\_ATOMIC}, queue work, submit URBs & sleep, mutexes, \code{wait\_for\_completion} \\
+Hard interrupt & very short work & everything above that takes time \\
+\bottomrule
+\end{tabularx}
+\caption{What each execution context allows.}
+\end{table}
+
+The synchronous helper \code{bbc\_xfer} in the project waits on a completion, so it may only be called from process context. The project respects this: it is used by the hash functions (which run in the caller's context) and by probe, never from a URB completion.
+
+\section{Memory, scatterlists and DMA}
+
+Kernel memory is allocated in several ways. \code{kmalloc} returns physically contiguous memory suitable for DMA. \code{vmalloc} returns memory that is contiguous only virtually. Pages can be taken directly for large buffers. The crypto layer avoids assuming a buffer is contiguous: data is described by a \emph{scatterlist}, an array of (page, offset, length) entries that together form a logical buffer. A driver that wants a flat buffer copies in or out.
+
+The project does exactly that. A request's source and destination scatterlists are copied into the flat command buffer with \code{sg\_pcopy\_to\_buffer} and back with \code{sg\_pcopy\_from\_buffer}. Both take an offset, which is how a chunk in the middle of a long request is read and written without copying the rest. This costs one extra copy per direction. A DMA aware driver would map the scatterlist for the device and avoid the copy, but USB transfers go through the host controller, and the extra copy is small next to the USB transfer time.
+
+\section{Locking in more detail}
+
+The driver uses three lock levels, always taken in the same order.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+Lock & Kind & Protects \\
+\midrule
+\code{bbc\_algs\_lock} & mutex & registration of the algorithms against board arrival and removal \\
+\code{bbc\_reg\_lock} & spinlock & the global board list, device ids and the round robin pointer \\
+\code{d->lock} & spinlock & everything about one board: the four command lists, counters of queued and in-flight commands, the \code{dead} flag \\
+\bottomrule
+\end{tabularx}
+\caption{Locks of the host driver, outermost first.}
+\end{table}
+
+Two rules keep this simple. First, callbacks into the crypto layer are never made while a lock is held, because a callback can submit new requests and take the same lock again. Completed commands are first moved to a list under the lock, and a work item later runs their callbacks with no lock held. Second, only short, non sleeping things happen under a spinlock: list manipulation, counter updates, and the decision to send.
+
+\section{Reference counts and object lifetime}
+
+Table~\ref{tab:refs} lists what holds a reference to what. The \code{kref} pattern replaces explicit ownership: each holder takes a reference before use and releases it after, and the final release frees the object.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lXl}
+\toprule
+Object & Holders of a reference & Freed by \\
+\midrule
+board (\code{bbc\_dev}) & the USB interface data pointer, each queued work item, each command, the timer, each caller of \code{bbc\_get} & \code{bbc\_release} \\
+command (\code{bbc\_cmd}) & the engine, each URB submission of it, a synchronous waiter & \code{bbc\_cmd\_free} \\
+\bottomrule
+\end{tabularx}
+\caption{Reference holders.}\label{tab:refs}
+\end{table}
+
+\code{bbc\_kick} shows the pattern in four lines: it takes a reference on the board, tries to queue the work, and if the work was already queued (so it will run once anyway) drops the extra reference at once. The work function releases its reference when it ends. A board structure therefore cannot be freed while a work item that refers to it is pending.
+
+\section{Tools for observing a driver}
+
+A driver cannot be understood without looking at it running. The tools used during this project are standard.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+Tool & What it shows \\
+\midrule
+\code{dmesg} & kernel log: the driver's \code{dev\_info} and \code{dev\_err} lines, probe and disconnect messages, warnings from the crypto core \\
+\code{lsusb -v}, \code{lsusb -t} & descriptors the device presents and the tree of devices and bound drivers \\
+\code{/sys/bus/usb/drivers/bbcrypto/} & which interfaces are bound, and the driver's own files \code{stats} and \code{ping} \\
+\code{/sys/module/bbcrypto/parameters/} & current values of \code{prio}, \code{window} and \code{chunk} \\
+\code{/proc/crypto} & every registered algorithm with name, driver, priority, type and flags \\
+\code{modinfo} & module metadata, parameters, vermagic \\
+\code{lsmod}, \code{insmod}, \code{rmmod} & loaded modules, load and unload \\
+\bottomrule
+\end{tabularx}
+\caption{Observation tools.}
+\end{table}
+
+The project adds one more on purpose: the \code{stats} file. Counters for requests, bytes, errors and retries let a test prove not only that an answer was right, but that it was computed on the board.
+
+\section{Kernel versions and the missing stable interface}
+
+User space has a stable binary interface; the kernel does not promise one for modules. Internal functions change between versions, headers move, and a module compiled for one kernel refuses to load into another because the module records a version string and symbol checksums (the \emph{vermagic} and \emph{modversions}). This has a practical consequence for the project: the module must be rebuilt for the kernel of the machine it runs on. That is why the deployment script builds on the target and does not copy a binary.

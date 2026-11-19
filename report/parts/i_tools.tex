@@ -1,0 +1,81 @@
+\chapter{Tools, demonstrations and operation}\label{ch:tools}
+
+\section{The command line client}
+
+\code{tools/bbcrypt.c} is a small program that sends a file or standard input through one of the board's algorithms by driver name. It is a thin layer over AF\_ALG and shows the interface in about 260 lines.
+
+\begin{lstlisting}[style=shell]
+bbcrypt hash sha256 file
+bbcrypt hmac <hexkey> file
+bbcrypt enc cbc <hexkey> <hexiv> < plain > cipher
+bbcrypt dec cbc <hexkey> <hexiv> < cipher > plain
+bbcrypt gcm-enc <hexkey> <hexiv12> [hexaad] < plain > cipher_and_tag
+bbcrypt -b hash sha256 file     # same, in the kernel, for comparison
+\end{lstlisting}
+
+The \code{-b} switch selects the in-kernel implementation by its generic name, so one can compare the board's output with the PC's own with identical commands. Input is limited to 192 KiB for encryption because one AF\_ALG request must fit the socket buffer; the program refuses larger input instead of hanging.
+
+\section{The demonstrations}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{rlX}
+\toprule
+\# & File & What it shows \\
+\midrule
+1 & \code{1\_hash.py} & SHA-1, SHA-256 and HMAC on the board against Python's \code{hashlib} \\
+2 & \code{2\_aes.py} & CBC on the board decrypted by the PC's AES, and the reverse \\
+3 & \code{3\_gcm.py} & GCM against a software implementation; forged data is rejected \\
+4 & \code{4\_priority.py} & which provider answers a plain \code{sha256} request, and how \code{prio} changes it \\
+5 & \code{5\_parallel.py} & 64 concurrent hashes, with the request counter showing pipelining \\
+6 & \code{6\_hash.c} & the same interface from C, checked against \code{sha256sum} \\
+7 & \code{7\_verify\_files.py} & a manifest and verify tool like \code{sha256sum -c}; detects change and deletion \\
+8 & \code{8\_encrypt\_file.py} & authenticated file encryption in 16 KiB chunks, key from a passphrase \\
+9 & \code{9\_signed\_token.py} & HS256 web tokens signed by the board \\
+10 & \code{10\_benchmark.py} & board against the local CPU \\
+11 & \code{11\_resilience.py} & what happens when the board disappears during work \\
+\bottomrule
+\end{tabularx}
+\caption{The eleven demonstration programs.}
+\end{table}
+
+All the Python demos use only the standard library and share a short helper module (\code{demos/bbc.py}) that wraps the \code{AF\_ALG} socket calls in four functions. Demos 1 to 5 and 7 to 9 are the ones in the quick batch (\code{run\_all.sh}); demos 10 and 11 are slow or interactive.
+
+\paragraph{Demo 8 in detail.} The encryptor derives a 256 bit key from the passphrase with scrypt and a random salt, picks a random file id, and cuts the input into 16 KiB pieces. Each piece is sealed with GCM on the board. The nonce is the file id followed by the piece number, and the associated data holds the piece number and a flag saying whether it is the last piece. Because the tag covers both, reordering pieces, dropping a piece, or cutting the file short makes the final check fail, which is what the \emph{file cut after chunk 1} line in the demo output shows. A wrong passphrase or a flipped bit fails the first tag check.
+
+\paragraph{Demo 11 in detail.} The resilience demo keeps hashing and prints counts of successes and failures while the board is disconnected or, with root and \code{--simulate}, deauthorised in software. This is the interactive version of the automatic unplug test.
+
+\section{The hardware proof}
+
+A claim that the board uses its hardware engine needs evidence. \code{tools/board\_aes.c} runs \emph{on the board}. It issues back to back 32 KiB cipher requests through AF\_ALG, the way the daemon does, and prints the time. Run once with the name of the hardware backed algorithm and once with a pure software driver, the difference shows which one the kernel selected. The host driver's own \code{INFO} string also names the driver the daemon resolved, which is the second piece of evidence.
+
+\section{Operating the system}
+
+\paragraph{Daily use.} With the module installed (Section~\ref{ch:build}), plugging the board in is enough: udev loads the module, the driver probes the interface, and the algorithms are registered. \code{dmesg} shows one line from the driver, naming the board and its algorithm drivers. From then on any program can use \code{sha256-bbcrypto} and the other driver names.
+
+\paragraph{Making the board the default.} \code{modprobe -r bbcrypto \&\& modprobe bbcrypto prio=400} raises the priority above the in-kernel implementations. Then a plain request such as \code{sha256} is served by the board. This is a demonstration and not a recommendation, since the board is much slower.
+
+\paragraph{Tuning.} \code{window} and \code{chunk} can be written to \code{/sys/module/bbcrypto/parameters/} while the system runs. The test suite does that to check results stay correct for every setting.
+
+\paragraph{Restarting the board side.} \code{rc-service bbcrypto restart} on the board stops the service the safe way: it unbinds the gadget first. The link drops for a short while, so run it detached or from the serial console.
+
+\section{Troubleshooting}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{p{4.2cm}X}
+\toprule
+Symptom & Likely cause and check \\
+\midrule
+Module does not load: ``Key was rejected'' or ``Required key not available'' & Secure Boot is enforcing signatures and the module is unsigned. Disable it or sign the module. \\
+\code{modprobe} says exec format error or unknown symbol & module built for a different kernel; rebuild on the target. \\
+Module loads but no board is bound & \code{lsusb} for \code{1d6b:0104}; check the daemon is running on the board and the gadget is bound (\code{/sys/class/udc}); look at \code{dmesg} for ``board did not answer INFO''. \\
+Requests fail with \code{ENODEV} & no board attached, or the board was removed; re-plug or restart the board service. \\
+Requests fail with \code{ETIMEDOUT} & the daemon is not answering; check its log on the board (\code{/var/log/bbcryptod.log}). \\
+GCM tests fail or are missing & the PC kernel lacks the AF\_ALG AEAD module; some distributions disable it. Try \code{modprobe algif\_aead}. \\
+Throughput much lower than expected & \code{window} too small; read \code{stats} for retries, which should be zero. \\
+Whole board hangs & the daemon was killed with the gadget bound. Always stop it through the service, which unbinds first. \\
+\bottomrule
+\end{tabularx}
+\caption{Common problems.}
+\end{table}

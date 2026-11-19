@@ -1,0 +1,1121 @@
+\documentclass[11pt,a4paper,oneside]{report}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage[a4paper,margin=2.6cm]{geometry}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{fancyhdr}
+\usepackage{listings}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc,backgrounds,decorations.pathreplacing}
+\usepackage[hidelinks,colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black,citecolor=blue!50!black]{hyperref}
+
+\setlist{itemsep=2pt,topsep=4pt}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+\captionsetup{font=small,labelfont=bf}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\nouppercase{\leftmark}}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+
+\definecolor{codebg}{RGB}{247,247,250}
+\definecolor{kw}{RGB}{0,70,140}
+\definecolor{cm}{RGB}{90,110,90}
+\definecolor{strc}{RGB}{150,50,50}
+
+\lstdefinestyle{ckern}{
+  language=C,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cm}\itshape,
+  stringstyle=\color{strc},
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{black!20},
+  numbers=none,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=4,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+  aboveskip=8pt,
+  belowskip=6pt,
+  morekeywords={u8,u16,u32,u64,bool,__user,__init,__exit,uint8_t,uint16_t,uint32_t,size_t,ssize_t}
+}
+\lstdefinestyle{shell}{
+  language=sh,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cm}\itshape,
+  stringstyle=\color{strc},
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{black!20},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+  aboveskip=8pt,
+  belowskip=6pt
+}
+\lstset{style=ckern}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\proj}{\textsc{bbcrypto}}
+
+\tikzset{
+  box/.style={draw=black!70,rounded corners=2pt,thick,minimum height=8mm,align=center,font=\small,fill=white},
+  layer/.style={draw=black!70,rounded corners=2pt,thick,minimum height=9mm,minimum width=9.2cm,align=center,font=\small},
+  arr/.style={-{Stealth[length=2.2mm]},thick},
+  darr/.style={{Stealth[length=2.2mm]}-{Stealth[length=2.2mm]},thick},
+  lbl/.style={font=\scriptsize,fill=white,inner sep=1pt}
+}
+
+\title{\textbf{Linux Device Drivers and the \proj{} Project}\\[6pt]
+\large A USB crypto accelerator for the Linux kernel crypto API,\\
+built on a BeagleBone Black}
+\author{Aman Pathak}
+\date{November 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent
+This report has two parts. The first part explains how device drivers work in Linux. It covers the split between user space and the kernel, the device model, kernel modules, concurrency and memory rules in kernel code, the USB subsystem, the kernel crypto API, and the USB gadget side that lets a small computer pretend to be a USB device.
+The second part describes a driver built with those ideas. A BeagleBone Black connects to a PC over USB. A kernel module on the PC registers hash, cipher and authenticated encryption algorithms with the Linux crypto API. Every operation is sent over a USB bulk pipe to a daemon on the board, which runs it on the board's AM335x hardware crypto engines. The report covers the wire protocol, the asynchronous command engine in the module, the board daemon, the build and deployment path, the test results, and the problems met along the way.
+\end{abstract}
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+% ====================================================================
+\chapter{Introduction}
+% ====================================================================
+
+\section{Motivation}
+
+A computer is more than its processor. Disks, network cards, keyboards, displays and accelerators all sit behind small pieces of software that translate between a general kernel interface and one particular piece of hardware. These pieces are device drivers. In Linux they make up the largest part of the kernel source tree, and writing one is the standard way to learn how the kernel is organised.
+
+The aim of this project was to write a complete driver for a device that does not exist as a product. A BeagleBone Black is a small ARM board. Its AM335x processor contains hardware engines for AES and for the SHA family. The board can also present itself to a PC as a USB device. The project connects the two ideas. The PC sees a USB peripheral, loads a driver for it, and from then on the board's crypto engines are available to every program on the PC through the ordinary kernel crypto interface.
+
+\section{What was built}
+
+The result has two programs and one shared header.
+
+\begin{itemize}
+  \item \textbf{A kernel module on the PC} (\code{host/bbcrypto.c}). It is a USB driver. When the board is plugged in, the module binds to it, then registers algorithms with the kernel crypto API: \code{sha1}, \code{sha256}, \code{hmac(sha256)}, \code{ecb(aes)}, \code{cbc(aes)}, \code{ctr(aes)} and \code{gcm(aes)}.
+  \item \textbf{A daemon on the board} (\code{board/bbcryptod.c}). It exposes a vendor specific USB interface through FunctionFS, reads requests from the PC, executes them through the board's own kernel (which uses the AM335x hardware), and sends replies.
+  \item \textbf{A protocol header} (\code{proto.h}) included by both sides, so the message layout is defined once.
+\end{itemize}
+
+Around those sit a test suite with 690 checks, a command line tool, eleven demonstration programs, deployment scripts for a remote machine, and service files for the board.
+
+\section{How to read this report}
+
+Chapters~\ref{ch:kernel} to~\ref{ch:gadget} are general. A reader who already knows Linux driver programming can skip to Chapter~\ref{ch:design}. Chapters~\ref{ch:design} to~\ref{ch:board} describe the design and the code in detail. Chapter~\ref{ch:tools} covers the tools, demonstrations and operation, Chapter~\ref{ch:build} building and deployment, Chapter~\ref{ch:test} the testing and measurements, Chapter~\ref{ch:lessons} the problems met, and Chapter~\ref{ch:security} the security considerations. A glossary and a bibliography close the report. Source files are referred to by their path in the repository.
+
+% ====================================================================
+\part{How Linux drivers work}
+% ====================================================================
+
+\chapter{The kernel and its drivers}\label{ch:kernel}
+
+\section{User space and kernel space}
+
+Linux separates code into two privilege levels. Programs run in \emph{user space}. They cannot touch hardware, cannot read each other's memory, and can only ask the kernel to act for them through \emph{system calls}. The kernel runs in \emph{kernel space} with full access to memory and devices. A driver is kernel code, so a bug in a driver can crash the whole machine or corrupt memory belonging to any process. That is why drivers are written in a defensive style, with every error path handled and every resource counted.
+
+Figure~\ref{fig:layers} shows the layers a request passes through. A program calls a system call such as \code{read}, \code{write}, \code{ioctl} or \code{sendmsg}. The \emph{virtual file system} or another subsystem routes the call to the right kernel component. That component may be a driver, which then talks to hardware.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=3mm]
+  \node[layer,fill=blue!6] (app) {Applications (user space)};
+  \node[layer,fill=blue!10,below=of app] (sys) {System call interface};
+  \node[layer,fill=orange!12,below=of sys] (sub) {Kernel subsystems (VFS, networking, crypto, USB core)};
+  \node[layer,fill=orange!22,below=of sub] (drv) {Device drivers};
+  \node[layer,fill=gray!15,below=of drv] (hw) {Hardware};
+  \foreach \a/\b in {app/sys,sys/sub,sub/drv,drv/hw} \draw[darr] (\a) -- (\b);
+  \draw[decorate,decoration={brace,amplitude=4pt}] ([xshift=3mm]app.north east) -- ([xshift=3mm]app.south east) node[midway,right=5pt,font=\scriptsize]{user};
+  \draw[decorate,decoration={brace,amplitude=4pt}] ([xshift=3mm]sys.north east) -- ([xshift=3mm]drv.south east) node[midway,right=5pt,font=\scriptsize]{kernel};
+\end{tikzpicture}
+\caption{Layers between a program and a device.}\label{fig:layers}
+\end{figure}
+
+\section{What a driver is}
+
+A driver is the part of the kernel that knows one kind of hardware. It has two faces.
+
+\begin{itemize}
+  \item \textbf{Towards the hardware} it knows registers, interrupts, buses and protocols.
+  \item \textbf{Towards the rest of the kernel} it implements an interface that a subsystem defines, so that the subsystem can treat all devices of one kind in the same way.
+\end{itemize}
+
+A block driver implements the block layer interface, a network driver implements the network device interface, and a character driver implements file operations. The driver in this project is unusual in one respect. It is a \emph{USB driver} towards the hardware, but towards the rest of the kernel it is a \emph{crypto algorithm provider}. It does not create a device node. Instead it adds entries to the crypto API's table of algorithms.
+
+\section{Classes of drivers}
+
+Linux traditionally describes three classes.
+
+\begin{description}
+  \item[Character devices] give a stream of bytes with \code{open}, \code{read}, \code{write} and \code{ioctl}. Serial ports, input devices and many sensors are of this class.
+  \item[Block devices] transfer fixed size blocks and are used for storage. The block layer adds queuing and caching above them.
+  \item[Network interfaces] send and receive packets. They do not appear as files but as interfaces managed through sockets.
+\end{description}
+
+Many drivers do not fit one class cleanly. USB drivers sit on top of the USB core and may then present themselves as any class, or as a provider for another subsystem as in this project.
+
+\section{Loadable modules}
+
+Most drivers are built as \emph{loadable kernel modules}. A module is an object file with the suffix \code{.ko}. It is linked into the running kernel with \code{insmod} or \code{modprobe} and removed with \code{rmmod}. Two functions mark its life.
+
+\begin{lstlisting}
+static int __init bbc_init(void)
+{
+	int ret;
+
+	bbc_wq = alloc_ordered_workqueue("bbcrypto", WQ_MEM_RECLAIM);
+	if (!bbc_wq)
+		return -ENOMEM;
+	ret = usb_register(&bbc_driver);
+	if (ret)
+		destroy_workqueue(bbc_wq);
+	return ret;
+}
+
+static void __exit bbc_exit(void)
+{
+	usb_deregister(&bbc_driver);
+	bbc_unregister_algs();
+	destroy_workqueue(bbc_wq);
+}
+
+module_init(bbc_init);
+module_exit(bbc_exit);
+\end{lstlisting}
+
+The init function runs when the module loads. It allocates what the driver needs globally and registers with the subsystem. If anything fails it must undo what it already did and return a negative error number. The exit function undoes everything in reverse order. The same listing from the project shows the pattern: allocate a workqueue, register the USB driver, and on failure release the workqueue.
+
+A module declares metadata with macros: \code{MODULE\_LICENSE("GPL")} matters because several kernel interfaces are only exported to GPL compatible modules. \code{MODULE\_DEVICE\_TABLE} writes the list of devices a driver handles into the module, so that tools can load the module automatically when matching hardware appears.
+
+\paragraph{Module parameters.} A module can take settings at load time and, if the permission bits allow it, change them at run time through \code{/sys/module/<name>/parameters/}. The project uses this for \code{prio}, \code{window} and \code{chunk}:
+
+\begin{lstlisting}
+static unsigned int prio = 50;
+module_param(prio, uint, 0444);      /* read only after load */
+
+static unsigned int window = 4;
+module_param(window, uint, 0644);    /* can be changed while running */
+\end{lstlisting}
+
+\paragraph{Out of tree builds.} A module is built against the headers and configuration of one particular kernel. The build uses the kernel's own \emph{kbuild} system, driven by a two line Makefile (\code{obj-m := bbcrypto.o}). A module built for one kernel version will not load into another, because the module records the kernel version string and symbol checksums.
+
+\section{Kernel programming rules}
+
+Kernel code lives under tighter rules than user programs. Several of them shaped this project.
+
+\paragraph{No standard library.} There is no \code{malloc}, \code{printf} or \code{pthread}. The kernel offers \code{kmalloc} and \code{kfree}, \code{printk} with the \code{dev\_err} family, and its own locking and threading primitives.
+
+\paragraph{Allocation flags.} \code{kmalloc} takes a flag that says what the allocator may do. \code{GFP\_KERNEL} may sleep to reclaim memory. \code{GFP\_ATOMIC} may not sleep, and is required in interrupt context. \code{GFP\_NOIO} forbids starting disk input or output, which avoids deadlock when the allocation happens on the path that writes data to disk. The driver uses \code{GFP\_NOIO} when it submits a request on behalf of a crypto operation, so that a crypto request can never wait on disk input or output, which could deadlock if the request itself sits on a storage path.
+
+\paragraph{Contexts and sleeping.} Code runs in one of several contexts. Process context belongs to a task and may sleep. Interrupt and softirq context may not sleep. A USB completion handler runs in interrupt (or softirq) context, so inside it the driver may only use spinlocks and non sleeping allocation, and anything that must sleep is handed off to a workqueue.
+
+\paragraph{Locking.} Shared data is protected by locks. A \emph{spinlock} busy waits and can be taken in interrupt context, so it protects short critical sections. A \emph{mutex} sleeps and protects longer ones. The variant \code{spin\_lock\_irqsave} also disables local interrupts, which is needed when an interrupt handler takes the same lock. The driver's per board state is under one spinlock, and completion callbacks are never invoked while it is held.
+
+\paragraph{Reference counting.} The lifetime of an object that several parties point to is managed with a \code{struct kref}. Each user takes a reference and drops it when done, and the last drop frees the object. This is how the driver stops a board structure from disappearing while a request still refers to it after the USB cable was pulled.
+
+\paragraph{Deferred work.} Heavy or sleeping work is put on a \emph{workqueue}, which runs a function later in process context. The project uses one ordered workqueue so that its work items run one at a time, in order, and need less locking.
+
+\paragraph{Errors are negative numbers.} Functions return \code{0} for success or a negative \code{errno} value such as \code{-ENOMEM} or \code{-ENODEV}. Asynchronous operations return \code{-EINPROGRESS} when they have been accepted and will finish later.
+
+\section{The device model and sysfs}
+
+The kernel keeps an internal tree of buses, devices and drivers, the \emph{device model}. Each bus type (PCI, USB, platform and so on) holds a list of devices and a list of drivers. When a new device appears the bus tries to match it with a driver, using an \emph{id table}, and on a match calls the driver's \code{probe} function. When the device goes away it calls \code{disconnect} (or \code{remove}). The tree is exported to user space as a file system, \emph{sysfs}, under \code{/sys}. A driver can add its own files there. This project adds two files below the USB interface directory: \code{stats} and \code{ping}.
+
+\input{parts/a_kernel}
+
+\chapter{USB from the driver's point of view}\label{ch:usb}
+
+\section{The bus}
+
+USB is a host controlled bus. One host, the PC, starts every transfer. Devices only answer. Devices hang from a tree of hubs, and each has an address assigned when it is enumerated. The host controller driver (xHCI on a modern PC) is part of the kernel and deals with the bus hardware. A device driver does not talk to it directly. It talks to the \emph{USB core}, which provides a uniform API.
+
+\section{Descriptors}
+
+When a device is plugged in, the host reads a set of \emph{descriptors} that describe it. They form a hierarchy (Figure~\ref{fig:desc}).
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=5mm and 12mm]
+  \node[box,fill=blue!8] (dev) {Device descriptor\\vendor id, product id};
+  \node[box,fill=blue!8,right=of dev] (cfg) {Configuration\\power, interfaces};
+  \node[box,fill=orange!15,right=of cfg] (if) {Interface\\class, subclass, protocol};
+  \node[box,fill=green!12,above right=2mm and 12mm of if] (e1) {Endpoint\\bulk OUT};
+  \node[box,fill=green!12,below right=2mm and 12mm of if] (e2) {Endpoint\\bulk IN};
+  \draw[arr] (dev) -- (cfg);
+  \draw[arr] (cfg) -- (if);
+  \draw[arr] (if) -- (e1);
+  \draw[arr] (if) -- (e2);
+\end{tikzpicture}
+\caption{USB descriptor hierarchy as seen by the driver.}\label{fig:desc}
+\end{figure}
+
+A \emph{configuration} groups \emph{interfaces}. Each interface is one function of the device and is what a Linux driver binds to. An interface has \emph{endpoints}, which are the data pipes. Each endpoint has a direction (IN means device to host, OUT means host to device), a transfer type, and a maximum packet size.
+
+\section{Transfer types}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lXl}
+\toprule
+Type & Purpose & Guarantee \\
+\midrule
+Control & configuration and commands, always on endpoint 0 & delivery, small \\
+Bulk & large, loss free data when the bus has spare time & delivery, no timing \\
+Interrupt & small data polled at a fixed rate & latency bound \\
+Isochronous & streams such as audio & timing, no retry \\
+\bottomrule
+\end{tabularx}
+\caption{USB transfer types.}
+\end{table}
+
+This project uses \emph{bulk} transfers. Bulk is the right choice for a transfer of tens of kilobytes where correctness matters and timing does not. On a high speed link a bulk packet carries up to 512 bytes. A bulk transfer ends with a packet shorter than the maximum, or with a zero length packet. The project's protocol relies on this rule and has one special case for it, described in Section~\ref{sec:pad}.
+
+\section{The driver structure}
+
+A USB driver describes itself to the USB core with a \code{struct usb\_driver}.
+
+\begin{lstlisting}
+static const struct usb_device_id bbc_ids[] = {
+	{USB_DEVICE_AND_INTERFACE_INFO(0x1d6b, 0x0104,
+		BBC_USB_CLASS, BBC_USB_SUBCLASS, BBC_USB_PROTO)},
+	{}};
+MODULE_DEVICE_TABLE(usb, bbc_ids);
+
+static struct usb_driver bbc_driver = {
+	.name = DRV,
+	.probe = bbc_probe,
+	.disconnect = bbc_disconnect,
+	.id_table = bbc_ids,
+};
+\end{lstlisting}
+
+The \emph{id table} says which devices the driver wants. The project matches on the vendor and product id of the Linux gadget composite device (\code{1d6b:0104}) \emph{and} on the interface class triple (\code{0xff}, \code{0x5c}, \code{1}). Matching on the interface triple is what makes the driver bind to the one vendor specific interface of the board, and leave the serial and network functions of the same composite device to other drivers.
+
+\section{URBs}
+
+Data moves with \emph{URBs}, USB request blocks. An URB describes one transfer: the pipe, a buffer, a length, and a completion function. The driver fills one with \code{usb\_fill\_bulk\_urb}, submits it with \code{usb\_submit\_urb}, and returns at once. Later the USB core calls the completion function, in interrupt context, when the transfer finished or failed.
+
+\begin{lstlisting}
+usb_fill_bulk_urb(c->urb, d->udev, d->pipe_out,
+		  c->obuf, c->olen, bbc_out_complete, c);
+usb_anchor_urb(c->urb, &d->anchor);
+ret = usb_submit_urb(c->urb, GFP_NOIO);
+\end{lstlisting}
+
+This listing is the heart of the transmit path. The \emph{anchor} is a list that collects all URBs of one device, so that on disconnect they can be cancelled in one call with \code{usb\_kill\_anchored\_urbs}. Without it the driver would have to track every outstanding URB itself.
+
+\section{Probe and disconnect}
+
+\code{probe} runs when a matching interface appears. It finds the endpoints, allocates the per device structure, posts the receive URB, checks that the device answers, creates sysfs files and registers whatever it provides. \code{disconnect} runs when the device is removed, possibly in the middle of a transfer. It must stop all traffic, fail or finish every pending request, and release every resource. Both functions are covered for this project in Section~\ref{sec:probe}.
+
+A subtle point is that \code{disconnect} can race with anything: a request may be submitted by a program at the moment the cable is pulled. A driver defends with a flag (the project uses \code{dead}) set under the same lock that protects its queues, and reference counts that keep the structure alive until the last user lets go.
+
+\input{parts/b_usb}
+
+\chapter{The kernel crypto API}\label{ch:crypto}
+
+\section{Why an API}
+
+The kernel needs cryptography for file system encryption, disk encryption, IPsec, TLS offload and more. Rather than let each user choose an implementation, the kernel offers one \emph{crypto API} and lets many implementations register behind it. A caller asks for an algorithm by \emph{name}, such as \code{sha256} or \code{cbc(aes)}. The core picks the best implementation.
+
+\section{Names, drivers and priority}
+
+Every registered algorithm has three properties that matter here.
+
+\begin{itemize}
+  \item \code{cra\_name} is the generic algorithm, for example \code{cbc(aes)}.
+  \item \code{cra\_driver\_name} identifies one implementation, for example \code{cbc-aes-bbcrypto}.
+  \item \code{cra\_priority} orders implementations of the same generic name. The highest wins.
+\end{itemize}
+
+Table~\ref{tab:prio} shows the real situation on the machine used for testing. Generic \code{sha256} resolves to the in-kernel library implementation at priority 300. The board's implementation sits at 50, so it is only used when someone asks for \code{sha256-bbcrypto} by its driver name or raises the module's \code{prio} parameter above 300.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{rll}
+\toprule
+Priority & Driver name & Provider \\
+\midrule
+300 & \code{sha256-lib} & kernel library code \\
+50 & \code{sha256-bbcrypto} & this project (synchronous interface) \\
+50 & \code{sha256-async-bbcrypto} & this project (asynchronous interface) \\
+\bottomrule
+\end{tabular}
+\caption{Providers of \code{sha256}, as printed by demo~4.}\label{tab:prio}
+\end{table}
+
+The default of 50 is deliberate. The board is far slower than the CPU, so no program should be moved onto it by accident.
+
+\section{Algorithm types}
+
+The API has separate interfaces for different shapes of operation.
+
+\begin{description}
+  \item[shash] Synchronous hashing. The call returns when the digest is ready. It may not sleep waiting for hardware in the usual sense, which suits software implementations.
+  \item[ahash] Asynchronous hashing for hardware. A request is submitted and a completion callback fires later.
+  \item[skcipher] Symmetric ciphers, always with a request structure, and asynchronous if the implementation sets \code{CRYPTO\_ALG\_ASYNC}.
+  \item[aead] Authenticated encryption with associated data, for modes such as GCM.
+\end{description}
+
+\paragraph{Asynchronous requests.} An asynchronous implementation returns \code{-EINPROGRESS} from its \code{encrypt} function and later calls \code{skcipher\_request\_complete} (or the equivalent) to report the result. This is how hardware drivers avoid blocking the caller while a device works. The project makes all ciphers and GCM asynchronous, and offers hashing in both styles.
+
+\section{Registering an algorithm}
+
+An implementation fills in a descriptor and registers it. The project does this with a macro that expands to one \code{struct skcipher\_alg} per cipher.
+
+\begin{lstlisting}
+static struct bbc_skcipher bbc_ciphers[] = {
+	BBC_CIPHER(BBC_ALG_ECB_AES, "ecb(aes)", "ecb-aes-bbcrypto",
+		   AES_BLOCK_SIZE, 0),
+	BBC_CIPHER(BBC_ALG_CBC_AES, "cbc(aes)", "cbc-aes-bbcrypto",
+		   AES_BLOCK_SIZE, AES_BLOCK_SIZE),
+	BBC_CIPHER(BBC_ALG_CTR_AES, "ctr(aes)", "ctr-aes-bbcrypto",
+		   1, AES_BLOCK_SIZE),
+};
+\end{lstlisting}
+
+The flag \code{CRYPTO\_ALG\_ASYNC} tells callers that the algorithm may complete later. \code{CRYPTO\_ALG\_ALLOCATES\_MEMORY} tells them it may allocate during a request, which matters for callers that cannot tolerate that.
+
+\section{AF\_ALG: reaching the kernel from user space}
+
+The kernel crypto API is internal. Programs reach it through a socket family called \code{AF\_ALG}. A program creates a socket, \emph{binds} it to a type and an algorithm name (or driver name), sets a key, \emph{accepts} to obtain an operation socket, and then sends data and reads the result.
+
+\begin{lstlisting}[language=C]
+s = socket(AF_ALG, SOCK_SEQPACKET, 0);
+bind(s, {family=AF_ALG, type="skcipher", name="cbc-aes-bbcrypto"});
+setsockopt(s, SOL_ALG, ALG_SET_KEY, key, keylen);
+op = accept(s, NULL, 0);
+sendmsg(op, data, control={ALG_SET_OP, ALG_SET_IV});
+read(op, out, len);
+\end{lstlisting}
+
+The same interface is used by the board daemon, which is how it reaches the AM335x engines. It is also how every test and demo in this project reaches the PC side driver, so the project's own software is the first user of the thing it provides.
+
+\input{parts/c_crypto}
+
+\chapter{The USB gadget side}\label{ch:gadget}
+
+\section{A computer as a USB device}
+
+Most USB hardware is a host and a device that is a simple peripheral. A BeagleBone Black has a USB controller (the MUSB core) that can act as either. When it acts as a device, Linux on the board runs the \emph{gadget framework}. The controller is the \emph{UDC}, the USB device controller. A \emph{gadget} is a configuration of functions that the board presents.
+
+\section{ConfigFS gadgets}
+
+Modern kernels let user space build a gadget through \emph{configfs}, a file system of kernel objects that user space creates with \code{mkdir}. The structure used on the board is:
+
+\begin{lstlisting}[style=shell]
+/sys/kernel/config/usb_gadget/g1/          # the gadget (id 1d6b:0104)
+    configs/c.1/                           # one configuration
+    functions/acm.*   functions/ecm.*      # serial and ethernet
+    functions/ffs.bbc                      # this project
+    UDC                                    # write the controller name to start
+\end{lstlisting}
+
+Linking a function directory into a configuration adds it. Writing the name of the controller into \code{UDC} binds the gadget and makes the board appear on the USB bus. Writing an empty string unbinds it.
+
+\section{FunctionFS}
+
+Standard functions such as serial or network are implemented in the kernel. For a vendor specific function, Linux offers \emph{FunctionFS}. It implements the gadget side of a function in \emph{user space}. After mounting a file system of type \code{functionfs}, a program opens \code{ep0}, writes the descriptors it wants the device to present, and then opens one file per endpoint, \code{ep1}, \code{ep2} and so on. Reading an OUT endpoint file receives data from the host. Writing an IN endpoint file sends data to the host. Events such as enable and disable arrive as records on \code{ep0}.
+
+This is the mechanism the board daemon uses. It means the board side of the project is an ordinary program, written in C, built with a cross compiler, and debuggable with ordinary tools, rather than a second kernel module.
+
+\input{parts/d_gadget}
+
+% ====================================================================
+\part{The \proj{} project}
+% ====================================================================
+
+\chapter{Design}\label{ch:design}
+
+\section{Requirements}
+
+The design started from a short list.
+
+\begin{enumerate}
+  \item Ordinary programs must be able to use the board through standard interfaces, without a custom library. This means integrating with the kernel crypto API and AF\_ALG.
+  \item The driver must be a real USB driver: id table, probe, disconnect, sysfs, module parameters, clean unload.
+  \item It must be correct for any input length, key size and operation order, and must be checked against a known good reference.
+  \item It must survive failures. If a packet is lost the operation must still complete. If the cable is pulled, nothing may crash or hang.
+  \item The board side must not require re-flashing the board. The board has no recovery path (no serial console recovery or SD card fallback was available during the work), so a bad kernel image would be expensive.
+\end{enumerate}
+
+A non-goal is speed. The measured throughput is a few megabytes per second, far below the PC's own CPU. The project demonstrates the mechanics of offload, not a performance gain.
+
+\section{Overall structure}
+
+Figure~\ref{fig:arch} shows the whole system.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=7mm and 10mm]
+  \node[box,fill=blue!8] (prog) {Program\\(AF\_ALG socket)};
+  \node[box,fill=orange!15,below=of prog] (crypto) {Kernel crypto API\\algorithm table};
+  \node[box,fill=orange!25,below=of crypto,minimum width=3.4cm] (mod) {\code{bbcrypto.ko}\\command engine};
+  \node[box,fill=gray!15,below=of mod] (usb) {USB core, xHCI};
+  \node[box,fill=gray!15,right=3.2cm of usb] (musb) {MUSB gadget\\controller};
+  \node[box,fill=green!14,above=of musb] (ffs) {FunctionFS\\\code{ep1}, \code{ep2}};
+  \node[box,fill=green!22,above=of ffs] (dmn) {\code{bbcryptod}};
+  \node[box,fill=green!14,above=of dmn] (balg) {board AF\_ALG};
+  \node[box,fill=yellow!22,above=of balg] (hw) {AM335x AES and SHA};
+  \draw[arr] (prog) -- (crypto);
+  \draw[arr] (crypto) -- (mod);
+  \draw[arr] (mod) -- (usb);
+  \draw[darr] (usb) -- node[lbl,above]{USB bulk} (musb);
+  \draw[arr] (musb) -- (ffs);
+  \draw[arr] (ffs) -- (dmn);
+  \draw[arr] (dmn) -- (balg);
+  \draw[arr] (balg) -- (hw);
+  \node[font=\small\bfseries,above=2mm of prog] {PC};
+  \node[font=\small\bfseries,above=2mm of hw] {BeagleBone Black};
+\end{tikzpicture}
+\caption{System architecture. A request goes down the left side and across the USB link, and the reply returns the same way.}\label{fig:arch}
+\end{figure}
+
+\section{The central idea}
+
+Because the board is a small, slow computer on a link that carries 512 byte packets, the design problem is to keep the link and the board busy at the same time. A simple driver would send one request, wait for the answer, and then send the next. That wastes the time the host spends preparing the next request, and the time the board spends idle. The solution is a \emph{window of commands in flight}, with tagging so replies can be matched, and a retransmission timer for lost packets. This turns a stop-and-wait protocol into a pipelined one. Figure~\ref{fig:pipe} shows the effect.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=0.5cm,y=0.5cm]
+  \tikzset{u/.style={fill=blue!25,draw=black!50},c/.style={fill=green!35,draw=black!50},r/.style={fill=orange!30,draw=black!50}}
+  \node[anchor=east,font=\small\bfseries] at (-0.3,6.4) {stop and wait};
+  \node[anchor=east,font=\scriptsize] at (-0.3,5.6) {USB link};
+  \node[anchor=east,font=\scriptsize] at (-0.3,4.6) {board};
+  \foreach \i in {0,1} {
+    \draw[u] (\i*10,5.2) rectangle (\i*10+2,6.0);
+    \draw[c] (\i*10+2,4.2) rectangle (\i*10+7,5.0);
+    \draw[r] (\i*10+7,5.2) rectangle (\i*10+9,6.0);
+  }
+  \node[anchor=east,font=\small\bfseries] at (-0.3,2.4) {pipelined};
+  \node[anchor=east,font=\scriptsize] at (-0.3,1.6) {USB link};
+  \node[anchor=east,font=\scriptsize] at (-0.3,0.6) {board};
+  \foreach \i in {0,1,2,3} {
+    \draw[u] (\i*5,1.2) rectangle (\i*5+2,2.0);
+    \draw[c] (\i*5+2,0.2) rectangle (\i*5+7,1.0);
+    \draw[r] (\i*5+7,1.2) rectangle (\i*5+9,2.0);
+  }
+  \draw[->] (0,-0.8) -- (22.5,-0.8) node[right,font=\scriptsize]{time};
+  \draw[u] (2,-2.2) rectangle (3,-1.6); \node[right,font=\scriptsize] at (3,-1.9) {send command};
+  \draw[c] (9,-2.2) rectangle (10,-1.6); \node[right,font=\scriptsize] at (10,-1.9) {board computes};
+  \draw[r] (16,-2.2) rectangle (17,-1.6); \node[right,font=\scriptsize] at (17,-1.9) {reply};
+\end{tikzpicture}
+\caption{Sketch of the idea (not measured). Each lane is one resource. With several commands in flight the next command is sent while the board is still computing the previous one.}\label{fig:pipe}
+\end{figure}
+
+\input{parts/e_design}
+
+\chapter{The wire protocol}\label{ch:proto}
+
+\section{Framing}
+
+Both sides include the same header, \code{proto.h}. It defines integers as little endian and uses a conditional typedef so that the same structure compiles in the kernel (\code{\_\_le32}) and in a normal program (\code{uint32\_t}).
+
+\begin{lstlisting}
+#ifdef __KERNEL__
+#include <linux/types.h>
+typedef __le32 bbc_u32;
+typedef __le16 bbc_u16;
+#else
+#include <stdint.h>
+typedef uint32_t bbc_u32;
+typedef uint16_t bbc_u16;
+#endif
+\end{lstlisting}
+
+One request is one USB bulk transfer. It is a 32 byte header followed by the key, the initialisation vector and the data, in that order. A reply is a 24 byte header followed by an optional IV and data.
+
+\begin{lstlisting}
+struct bbc_req {            /* 32 bytes */
+	bbc_u32 magic;      /* 0x43434242, "BBCC" */
+	bbc_u32 tag;        /* chosen by the host, echoed in the reply */
+	bbc_u16 op;
+	bbc_u16 flags;
+	bbc_u32 id;         /* hash session id, or assoc length */
+	bbc_u32 alg;
+	bbc_u32 keylen;
+	bbc_u32 ivlen;
+	bbc_u32 datalen;
+} __attribute__((packed));
+
+struct bbc_resp {           /* 24 bytes */
+	bbc_u32 magic;
+	bbc_u32 tag;
+	bbc_u32 status;     /* 0 or a negative errno */
+	bbc_u32 id;
+	bbc_u32 ivlen;
+	bbc_u32 datalen;
+} __attribute__((packed));
+\end{lstlisting}
+
+Limits are compile time constants: at most 32 KiB of data, 128 bytes of key and 16 bytes of IV per request.
+
+\section{Operations}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+Operation & Meaning \\
+\midrule
+\code{PING} & echo the data back, used for transport benchmarks \\
+\code{INFO} & return a text description of the board's algorithm drivers \\
+\code{HASH\_NEW} & start a hash session (key included for HMAC), returns an id \\
+\code{HASH\_UPDATE} & feed data into a session \\
+\code{HASH\_FINAL} & finish a session, return the digest, free the id \\
+\code{HASH\_CLONE} & duplicate a session's state, needed for \code{export}/\code{import} \\
+\code{HASH\_FREE} & discard a session \\
+\code{CIPHER} & one AES operation on a chunk; reply carries the chained IV \\
+\code{AEAD} & one complete GCM operation, stateless \\
+\bottomrule
+\end{tabularx}
+\caption{Protocol operations.}
+\end{table}
+
+A one-shot flag lets a hash be computed in a single command, without creating a session, which is the fast path for small inputs.
+
+\section{Tags, windows and retransmission}
+
+The host numbers every command with a \emph{tag}. The tag starts at a random value for each probe and counts up. Up to \code{window} commands (4 by default, at most 8) are outstanding. The board replies in the order it processes them, and each reply carries the tag of its command, so the host finds the right command by searching its in-flight list.
+
+Lost packets are handled on the host by a timer. A command whose reply has not arrived after 1000~ms is sent again with the \emph{same} tag. After four transmissions the command fails with \code{-ETIMEDOUT}. The board keeps its last 16 replies. When a request with a tag it has already answered arrives, it resends the cached reply instead of running the operation a second time. This matters for operations that are not idempotent. CBC encryption of a chunk with a changed chaining state would be wrong if executed twice.
+
+The random start of the tag counter closes one subtle gap. If the module is unloaded and loaded again while the board stays up, a counter restarting from zero would collide with tags still in the board's cache, and the board would answer a new command with a stale reply. Starting from a random value makes this vanishingly unlikely.
+
+\section{The short packet rule}\label{sec:pad}
+
+USB ends a bulk transfer with a short packet. If a message length is an exact multiple of 512, the last packet is full and the receiver cannot tell the transfer has ended unless a zero length packet follows. The protocol avoids the zero length packet by appending one pad byte in that case. The sender adds the byte; the receiver recognises that a one byte transfer after a message whose length was a multiple of 512 is only padding and discards it. The board code has a flag (\code{expect\_pad}) for exactly this.
+
+\input{parts/f_proto}
+
+\chapter{The host driver}\label{ch:host}
+
+The driver is one file of about 1,850 lines, \code{host/bbcrypto.c}. This chapter follows it from the outside in.
+
+\section{State kept for each board}
+
+\begin{lstlisting}
+struct bbc_dev {
+	struct kref ref;
+	struct list_head node;       /* in the global list of boards */
+	u32 devid;
+	struct usb_device *udev;
+	struct usb_interface *intf;
+	unsigned int pipe_out, pipe_in;
+
+	spinlock_t lock;
+	bool dead;
+	u32 tag;
+	struct list_head queue;      /* waiting for a window slot */
+	struct list_head inflight;   /* sent, awaiting a reply */
+	struct list_head donelist;   /* finished, waiting for ->done() */
+	struct list_head active;     /* cipher requests with chunks left */
+	unsigned int n_queued, n_inflight, max_inflight;
+
+	struct work_struct pump_work, done_work, fail_work;
+	struct delayed_work to_work;
+	struct usb_anchor anchor;
+	struct urb *rx_urb;
+	...
+};
+\end{lstlisting}
+
+The structure reads like a diagram of the engine. A command moves from \code{queue} to \code{inflight} to \code{donelist}. The three work items correspond to three jobs that cannot be done in interrupt context: \code{pump\_work} starts new commands, \code{done\_work} runs completion callbacks, and \code{fail\_work} cleans up after a disconnect. The delayed work \code{to\_work} is the retransmission timer.
+
+\section{The command engine}
+
+A \code{struct bbc\_cmd} represents one command. It owns its URB, its output buffer (the request as it goes on the wire), its reply buffer, its tag, a retry count, and a completion callback. It has a reference count because several parties hold it: the engine, the URB currently in flight, and sometimes a thread waiting synchronously.
+
+The life of a command (Figure~\ref{fig:cmd}):
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=9mm and 13mm]
+  \node[box,fill=blue!8] (q) {queue};
+  \node[box,fill=orange!15,right=of q] (i) {in flight};
+  \node[box,fill=green!14,right=of i] (d) {done list};
+  \node[box,fill=gray!12,right=of d] (c) {callback};
+  \draw[arr] (q) -- node[lbl,above]{slot free} (i);
+  \draw[arr] (i) -- node[lbl,above]{reply} (d);
+  \draw[arr] (d) -- node[lbl,above]{worker} (c);
+  \draw[arr,rounded corners=3pt] (i) -- ++(0,-1.0) -| node[lbl,pos=0.25,below]{timeout, resend} (i);
+\end{tikzpicture}
+\caption{States of a command in the engine.}\label{fig:cmd}
+\end{figure}
+
+\begin{enumerate}
+  \item A caller builds a command and submits it. It lands on \code{queue}.
+  \item \code{bbc\_send\_queued} moves commands to \code{inflight} while fewer than \code{window} are outstanding. It records the send time and arms the timer. It sends the command's URB.
+  \item The always-posted receive URB completes with a reply. \code{bbc\_rx\_complete} searches \code{inflight} for the tag, copies the reply into the command's buffer, and moves the command to \code{donelist}.
+  \item \code{done\_work} runs the callbacks from process context, then starts more commands.
+\end{enumerate}
+
+The receive path never lets the board's reply find no URB waiting. One receive URB is always posted. When it completes, the handler processes it and resubmits it at once. This is the one place the driver posts an URB from interrupt context, and the reason it uses \code{GFP\_ATOMIC} there.
+
+\begin{lstlisting}
+resubmit:
+	if (READ_ONCE(d->dead))
+		return;
+	usb_anchor_urb(u, &d->anchor);
+	ret = usb_submit_urb(u, GFP_ATOMIC);
+\end{lstlisting}
+
+If a reply matches no command, the handler ignores it. That happens when the board replays a cached reply for a command that already finished, and it is the normal sign that a retransmission and the original answer crossed.
+
+\section{Timeouts and retries}
+
+\code{bbc\_to\_work} runs every 100~ms while anything is in flight. It looks for commands whose last send is older than one second and whose output URB has already finished (\code{waiting} is set). It increments the retry counter, marks the command for resending, and sends it again outside the lock. After four attempts the command fails. Statistics count the retries, and in the final test run there were none.
+
+\section{Ciphers}
+
+A cipher request may be megabytes long, but a protocol command carries at most 32 KiB. The driver cuts a request into chunks of \code{chunk} bytes (16 KiB by default, a multiple of 16, adjustable at run time). How the chunks are chained depends on the mode.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lXl}
+\toprule
+Mode & Dependency between chunks & Pipelined \\
+\midrule
+ECB & none & yes \\
+CTR & none, once the counter for each chunk is computed in advance & yes \\
+CBC decrypt & chaining input is the previous \emph{ciphertext} block, known up front & yes \\
+CBC encrypt & chaining input is the previous \emph{output}, known only after the board replies & no, one at a time \\
+\bottomrule
+\end{tabularx}
+\caption{Chunking rules.}
+\end{table}
+
+For CTR the driver advances the counter by the number of blocks in each chunk with a big number addition (\code{bbc\_ctr\_add}). For CBC decryption it copies the last ciphertext block of a chunk into the IV for the next chunk before the chunk is even sent. For CBC encryption the board returns the new chaining value in the reply's IV field, and the driver uses it for the next chunk. That is an inherent serial dependency, and it is why CBC encryption cannot overlap its chunks.
+
+The entry point returns \code{-EINPROGRESS}:
+
+\begin{lstlisting}
+	list_add_tail(&cr->node, &d->active);
+	spin_unlock_irqrestore(&d->lock, fl);
+	bbc_kick(d, &d->pump_work);
+	return -EINPROGRESS;
+\end{lstlisting}
+
+The request is placed on the \code{active} list and the pump work emits chunks as window slots become free. When all chunks have finished, the last one completes the original request.
+
+\section{Hashes}
+
+Hashing keeps the synchronous \code{shash} interface but still runs through the engine, so threads that hash at the same time pipeline their commands. A hash descriptor remembers the board and the session id. The first \code{update} creates a session on the board with \code{HASH\_NEW}, later updates add data, and \code{final} fetches the digest. A hash session lives on one board, so the descriptor stores the device id and later calls use \code{bbc\_get\_id} to find the same board again.
+
+An asynchronous variant (\code{ahash}) registers the same algorithms under the names \code{sha1-async-bbcrypto}, \code{sha256-async-bbcrypto} and \code{hmac-sha256-async-bbcrypto}. It steps through the same sequence from callbacks.
+
+\section{GCM}
+
+GCM is registered as an \code{aead} algorithm. One request is one \code{AEAD} command: the data field holds the associated data followed by the text, plus the tag when decrypting. The associated data length goes in the request's \code{id} field and the tag length in the upper byte of \code{flags}. The reply holds the result. A forged tag comes back as status \code{-EBADMSG}, which the driver passes up to the caller unchanged. A request is limited to 32 KiB of associated data and text together.
+
+\section{Several boards}
+
+More than one board can be attached. A global list holds them. New cipher requests are spread round robin by \code{bbc\_get}, which advances a pointer through the list and takes a reference on the chosen board. Hash sessions stay on the board that created them.
+
+\section{Probe and disconnect}\label{sec:probe}
+
+The probe function does the following, in this order:
+
+\begin{enumerate}
+  \item Find the bulk IN and OUT endpoints with \code{usb\_find\_common\_endpoints}.
+  \item Allocate the per board structure, initialise the lists, locks and work items, choose a random starting tag.
+  \item Allocate the receive buffer and URB, and \emph{post the receive URB}.
+  \item Send an \code{INFO} command and wait. If the daemon does not answer, the probe fails. This proves the whole path works before anything is registered.
+  \item Create the sysfs files \code{stats} and \code{ping}.
+  \item Add the board to the global list. If this is the first board, register the crypto algorithms.
+\end{enumerate}
+
+Each step has a label in the error path that undoes the steps before it, the standard kernel \code{goto} cleanup pattern.
+
+Disconnect has to be careful in the other direction. It first removes the board from the list so no new request picks it, then sets the \code{dead} flag under the lock, kills all anchored URBs, cancels the timer, runs the failure work (which completes every pending request with an error), removes the sysfs files and drops its reference.
+
+One design decision deserves explanation. \emph{The algorithms stay registered after the last board disconnects.} The crypto core warns when an algorithm is unregistered while a transform for it still exists, and a program can hold an open AF\_ALG socket for as long as it likes. So the algorithms are only unregistered at module unload, which the kernel will not allow while a transform holds a reference to the module. While no board is attached, requests fail with \code{-ENODEV}.
+
+\section{Observability}
+
+Two sysfs files are provided on each board's interface directory.
+
+\paragraph{\code{stats}} reports the number of requests, bytes, errors and retries, the average latency in microseconds, the current and highest number of commands in flight, and the board's description string. The test suite and several demos read it to prove that work really reached the board.
+
+\paragraph{\code{ping}} runs a transport benchmark using the \code{PING} command, which echoes data without computing anything. It measures the USB path alone, separately from the cryptography.
+
+\input{parts/g_host}
+
+\chapter{The board side}\label{ch:board}
+
+\section{The platform}
+
+The board runs a Linux kernel configured for the AM335x. The configuration (kept in \code{board/kernel.config}) has the pieces the project needs: the MUSB controller in dual-role mode, configfs gadgets with the FunctionFS function, the user space crypto interfaces for hashing and symmetric ciphers, and the OMAP crypto drivers for AES and SHA (\code{CRYPTO\_DEV\_OMAP\_AES}, \code{CRYPTO\_DEV\_OMAP\_SHAM}). The userland is Alpine Linux with OpenRC and musl libc.
+
+The kernel was built without the AEAD interface for AF\_ALG (\code{CRYPTO\_USER\_API\_AEAD} is off). That has a consequence handled in Section~\ref{sec:gcmboard}.
+
+\section{Setting up the gadget}
+
+Two OpenRC services start the board side. \code{usbgadget} creates the base gadget with serial and Ethernet functions, which are the board's management path. \code{bbcrypto} adds the FunctionFS function to it, starts the daemon, and rebinds the controller. The relevant steps of its \code{start} function are:
+
+\begin{lstlisting}[style=shell]
+unbind                                   # write "" to UDC
+mountpoint -q $MNT && umount $MNT
+mkdir $F                                 # functions/ffs.bbc
+ln -s $F $G/configs/c.1/ffs.bbc          # add it to the configuration
+mkdir -p $MNT
+mount -t functionfs bbc $MNT
+start-stop-daemon --start --background ... bbcryptod $MNT
+sleep 1
+echo "$UDC" > $G/UDC                     # bind: the board re-enumerates
+\end{lstlisting}
+
+Two details came from experience. The daemon has to be running \emph{before} the gadget is bound, because FunctionFS needs its descriptors before the host sees the device. And the daemon must never be killed while the gadget is bound: doing so hung the board's kernel twice. The scripts therefore always unbind first. If binding fails, the script restores the original serial and Ethernet gadget so the board stays reachable.
+
+\section{The descriptors}
+
+The daemon builds its descriptors in the program and writes them to \code{ep0}. The interface has class 0xff (vendor specific), subclass 0x5c, protocol 1, and two bulk endpoints, OUT on 1 and IN on 2. The full speed descriptor uses a 64 byte maximum packet size and the high speed one uses 512. The interface string is \code{bbcrypto accel}.
+
+\section{Daemon structure}
+
+The daemon is organised as threads around one serving loop (Figure~\ref{fig:daemon}).
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}
+  \node[box,fill=blue!8] (ep1) at (0,0) {endpoint \code{ep1}\\(from PC)};
+  \node[box,fill=orange!15] (rx) at (4.6,0) {harvester thread\\AIO completions};
+  \node[box,fill=green!18] (srv) at (9.4,0) {serving loop\\decode, execute};
+  \node[box,fill=gray!15] (alg) at (9.4,2.1) {AF\_ALG\\AES, SHA engines};
+  \node[box,fill=yellow!22] (cache) at (4.6,-2.1) {reply cache\\16 entries};
+  \node[box,fill=orange!15] (wr) at (9.4,-2.1) {writer thread};
+  \node[box,fill=blue!8] (ep2) at (0,-2.1) {endpoint \code{ep2}\\(to PC)};
+  \draw[arr] (ep1) -- (rx);
+  \draw[arr] (rx) -- node[lbl,above]{ready queue} (srv);
+  \draw[darr] (srv) -- (alg);
+  \draw[arr] (srv) -- (wr);
+  \draw[arr] (wr) -- (ep2);
+  \draw[darr] (srv) -- (cache);
+\end{tikzpicture}
+\caption{Threads of the board daemon.}\label{fig:daemon}
+\end{figure}
+
+\paragraph{Reading with asynchronous I/O.} The daemon does not simply call \code{read} in a loop. On the AM335x gadget controller a packet that arrives while no read is queued on the endpoint can be lost. The first 512 byte packet of an OUT transfer disappears. A loop that calls \code{read}, handles the data and calls \code{read} again always leaves a short gap, and when the host pipelines several requests that gap is hit constantly. The daemon therefore uses the kernel's AIO interface to keep twelve read requests (\code{NSLOT}) queued on the endpoint at all times. The harvester thread collects completions, reassembles a request that arrived in several pieces, discards pad bytes, and puts complete requests on a ready queue. A request buffer is only taken out of the queue while it is being served, and then re-submitted.
+
+\paragraph{The serving loop.} It takes a request from the ready queue, checks the magic and lengths, and looks the tag up in the reply cache. A cached tag means a retry, so the cached reply is re-sent and nothing is executed. Otherwise the operation code selects a handler. The reply is built in a cache slot (so it can be replayed later), and handed to the writer.
+
+\paragraph{The writer thread.} Sending replies on a separate thread lets the serving loop begin the next request while the previous reply goes over USB. The extra thread handoff costs a little for tiny requests, which is a known trade off.
+
+\section{Executing operations}
+
+The daemon uses the board's crypto through AF\_ALG, the same interface a PC program uses. For a cipher it opens a socket bound to the algorithm \code{ecb(aes)}, \code{cbc(aes)} or \code{ctr(aes)}, sets the key, sends the data with an operation and IV as control messages, and reads the result. On the AM335x those names resolve to the OMAP drivers such as \code{cbc-aes-omap}.
+
+After a cipher operation the daemon computes the chaining value for the next chunk and returns it in the reply: for CBC the last ciphertext block, and for CTR the incremented counter.
+
+Hash sessions are held in a table of 256 slots, each keeping the AF\_ALG operation socket open between updates. \code{HASH\_CLONE} duplicates a session by accepting a new socket from the existing one.
+
+\section{GCM on the board}\label{sec:gcmboard}
+
+Because the board kernel has no AEAD interface for AF\_ALG, the AM335x GCM driver cannot be used from user space. Rebuilding and re-flashing the board kernel was rejected, because the board had no recovery path. Instead the daemon assembles GCM from parts, using the hardware for the part that costs time.
+
+GCM encrypts with counter mode and authenticates with GHASH, a polynomial hash in the field $GF(2^{128})$. The daemon computes:
+
+\begin{align*}
+H &= E_K(0^{128}) &&\text{(hash subkey, one ECB block)}\\
+J_0 &= IV \,\|\, 0^{31}1 &&\text{(for a 96 bit IV)}\\
+\text{keystream} &= E_K(J_0),\, E_K(J_0+1),\ldots &&\text{(one CTR run)}\\
+C &= P \oplus \text{keystream}_{1..}\\
+T &= \text{GHASH}_H(A, C) \oplus E_K(J_0)
+\end{align*}
+
+The trick is that one CTR operation over $16$ zero bytes followed by the text yields both $E_K(J_0)$ (the first keystream block, used as the tag mask) and the ciphertext keystream (the rest). So AES work stays on the hardware engine, and only GHASH is computed in software, using a 4 bit table method for the multiplication. Tags up to 16 bytes (the lengths the kernel's GCM check accepts) and any associated data length are supported, and the tag comparison on decrypt runs over all bytes without an early exit, so its time does not reveal where a forged tag first differs. A mismatch returns \code{-EBADMSG}. The code notes that if the board kernel is rebuilt with AEAD support, this function can be replaced by a single AF\_ALG call.
+
+\section{Handling the USB side}
+
+The main thread reads events from \code{ep0}. On \code{ENABLE} (the host selected the configuration) it starts a worker thread that opens \code{ep1} and \code{ep2} and runs the serving loop. On \code{DISABLE} it cancels the worker. Control requests that arrive for the interface are answered with a stall, since none are defined.
+
+\input{parts/h_board}
+
+\input{parts/i_tools}
+
+\chapter{Build and deployment}\label{ch:build}
+
+\section{Development workflow}
+
+Development happens on one machine and testing on another. Source is edited on the development PC. A script copies it to the machine the board is plugged into, builds the module there against that machine's running kernel, loads it and runs the tests. This matters because a kernel module must match the kernel it loads into, and because loading an unfinished kernel module on the machine one works on is a risk worth avoiding.
+
+\section{The pieces}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+Path & Content \\
+\midrule
+\code{proto.h} & the wire protocol shared by all components \\
+\code{host/} & the kernel module and its kbuild Makefile \\
+\code{board/} & daemon source, cross build script, installer, OpenRC services, gadget script, board kernel configuration \\
+\code{tests/} & the functional test suite \\
+\code{tools/} & a command line client and a hardware proof program \\
+\code{demos/} & eleven example programs \\
+\code{scripts/} & deployment and board network helper scripts \\
+\bottomrule
+\end{tabularx}
+\caption{Layout of the repository.}
+\end{table}
+
+\section{Building}
+
+\begin{lstlisting}[style=shell]
+make             # module, tests and the board daemon
+make host        # only the kernel module
+make board       # armv7 daemon (needs the musl sysroot)
+make lint        # clang-format check, pyflakes, bash -n
+make typecheck   # strict compile of tests, tools and demos
+\end{lstlisting}
+
+The module is built with kbuild against \code{/lib/modules/\$(uname -r)/build} unless \code{KDIR} says otherwise. The board daemon is cross compiled by \code{board/build.sh} with clang for \code{armv7-alpine-linux-musleabihf}, linked with lld against an Alpine sysroot that \code{scripts/fetch-sysroot.sh} downloads. Building against the board's own libc avoids the need to compile on the board.
+
+\section{Installing on the board}
+
+\code{board/install.sh} copies the daemon and the two OpenRC services to the board over SSH, backs up what it replaces (the original \code{usbgadget} service once, the previous daemon on every run) and restarts the service detached, since the restart briefly drops the USB link.
+
+\section{Deploying to the test machine}
+
+\code{scripts/deploy-host.sh} automates the PC side. It copies the source tree to the target, keeping the previous copy of each directory, then runs a remote script that:
+
+\begin{enumerate}
+  \item checks that kernel headers exist and installs them if not;
+  \item builds the module and the test programs;
+  \item installs the module in \code{/lib/modules/\ldots/extra} and runs \code{depmod}, which writes the USB alias so that plugging the board in loads the driver by itself;
+  \item loads the AF\_ALG helper modules, reloads \code{bbcrypto}, and waits until a board is bound;
+  \item runs the test suite and reports its exit status.
+\end{enumerate}
+
+The script takes the sudo password from an environment variable and passes it to \code{sudo -S} through a shell builtin, so the password never appears in the process list.
+
+\chapter{Testing and results}\label{ch:test}
+
+\section{Method}
+
+The functional suite is \code{tests/afalg\_test.c}. Its principle is to compare. For each algorithm it runs the same input through the in-kernel reference, requested by its plain name, and through the board, requested by driver name, and demands identical output. The reference for AES is the generic software implementation, and for GCM the generic CTR plus GHASH composition. Each cipher is also checked in the opposite direction, so that the board's output decrypts correctly under the reference.
+
+The inputs cover the awkward lengths, not only comfortable ones: 1, 15, 16, 17, 33, 1000, 32768, 32769, 32784, 100000 and 100001 bytes, and 1 MiB. They include the exact multiples of 512 that need the pad byte, sizes just over and under the 32 KiB command limit, and all three AES key sizes. GCM tests cover tag lengths, odd associated data lengths, and forged tags that must be rejected with \code{EBADMSG}. Further modes run concurrent threads, change \code{window} and \code{chunk} at run time, stress the engine for a set time, sweep throughput over parameters, and repeatedly deauthorise the device to test unplug handling.
+
+\section{Result}
+
+The suite ran on the test machine (Linux 6.18.60) against the real board. The result of the last full run was:
+
+\begin{center}
+\fbox{\parbox{0.8\textwidth}{\centering\ttfamily 690 passed, 0 failed}}
+\end{center}
+
+After that run and the demos, the driver's own counters read 24,699 requests, 70,833,691 bytes, 0 errors and 0 retries.
+
+\section{Demonstrations}
+
+The eleven programs in \code{demos/} use only the standard library and talk to the driver by AF\_ALG. The ones that are run in a batch confirmed the following.
+
+\begin{itemize}
+  \item Hash and AES results from the board equal the PC's own.
+  \item GCM output equals software GCM, and a flipped bit or a changed header is rejected.
+  \item The priority demo shows that a plain \code{sha256} request stays on the CPU by default, and goes to the board only with \code{prio} raised.
+  \item 64 concurrent hashes of 20 KB all come out right, with the commands pipelined.
+  \item A file integrity tool detects a changed file and a missing file.
+  \item An authenticated file encryption tool rejects a wrong passphrase, a flipped bit and a truncated file.
+  \item A signed token (HS256) from the board agrees with Python's own HMAC, and rejects a tampered or expired token.
+  \item A C program hashes a file through the board and matches \code{sha256sum}.
+\end{itemize}
+
+\section{Performance}
+
+Table~\ref{tab:perf} gives the throughput the test suite measured in its last run. The numbers come from the suite's own measurement lines.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lr}
+\toprule
+Measurement & Throughput \\
+\midrule
+SHA-256 through the board & 2.84 MB/s \\
+SHA-256 on the PC's CPU & 216 to 394 MB/s \\
+CBC-AES through the board & 2.71 MB/s \\
+\bottomrule
+\end{tabular}
+\caption{Measured throughput. The local figure varied between two runs.}\label{tab:perf}
+\end{table}
+
+The board is about two orders of magnitude slower than the PC's CPU, so the driver is a demonstration of mechanism and not an acceleration. The limits are the 1 GHz board processor, the small packet path through the MUSB controller, and the user space hop in the daemon. These results are consistent with the reasoning behind the low default priority.
+
+\input{parts/j_test}
+
+\chapter{Problems met and lessons}\label{ch:lessons}
+
+This chapter records the problems that shaped the final design. Each is a place where the first approach was wrong.
+
+\section{Lost packets on the board}
+
+The first version of the daemon read the endpoint in a loop. It worked when the PC sent one request at a time and failed under pipelining, with retries and almost no throughput. The cause lies in the board's USB controller. A packet that arrives while no read is queued can disappear. The fix was to keep many reads queued with asynchronous I/O (Section~\ref{ch:board}). The retransmission timer and the reply cache on the board were added at the same time, because even with the fix the protocol should tolerate loss.
+
+\section{Replays after a module reload}
+
+A reloaded module started its tag counter again and received old cached replies from the board. The symptom was wrong answers, not errors. The fix is the random starting tag.
+
+\section{Retransmission must not repeat work}
+
+Resending a command on timeout is only safe if executing it twice does no harm. Hashes with sessions and chained ciphers would be corrupted. The answer is the board's reply cache keyed by tag, which makes retransmission idempotent.
+
+\section{GCM without kernel support}
+
+The board kernel had no AEAD interface for AF\_ALG. A simple route would have been to rebuild the kernel. With no recovery path on the board, that risk was not accepted, so GCM was assembled in the daemon, using the hardware for the AES work. This also gave a worked example of how GCM is built from CTR and GHASH.
+
+\section{Never kill the daemon while the gadget is bound}
+
+Killing the daemon with the gadget bound hung the board's kernel twice. Every script now unbinds first. This is a recurring pattern in driver work: the order in which one tears things down matters as much as the order in which one sets them up.
+
+\section{Disconnect while busy}
+
+Pulling the cable while requests were in flight is the hardest case for a driver. The answer was reference counts on the board structure and on commands, a \code{dead} flag checked under the same lock as the queues, anchored URBs that can be cancelled together, and a failure work item that completes every pending request with an error. The unplug test repeats this in a loop.
+
+\section{Keeping the algorithms registered}
+
+Unregistering algorithms on disconnect made the crypto core warn when a program still held a socket. Leaving them registered, and failing with \code{-ENODEV} until a board returns, is the behaviour the core expects.
+
+\section{Environmental limits}
+
+A module must be built for the exact kernel it loads into. The module is unsigned, so a machine with Secure Boot enforcement will refuse it. Some distributions disable the AF\_ALG AEAD module, which the GCM tests need. The deployment script handles missing headers and tries to load the helper modules, and it reports clearly when loading fails.
+
+\section{What the work shows}
+
+\begin{itemize}
+  \item A driver is mostly lifetime management. The crypto algorithms were the easy part. Making the structure survive a cable pull, a timeout, a module reload and a socket held open by a program took most of the code.
+  \item The interface to a subsystem drives the design. Choosing the asynchronous crypto interfaces led directly to the command engine.
+  \item Hardware has quirks that no documentation lists. The lost packet problem was found by measurement, not by reading.
+  \item Testing against a reference is cheap and powerful. Comparing every output with the kernel's own implementation caught problems immediately and made later changes safe.
+\end{itemize}
+
+\input{parts/k_security}
+
+\chapter{Limitations and future work}
+
+\begin{itemize}
+  \item \textbf{Speed.} The accelerator is slower than the PC. A faster link or a faster board would change that, as would batching small requests.
+  \item \textbf{Security of the link.} The USB link is not authenticated or encrypted. Anyone with physical access to the cable can read the data and the keys, which are sent with each request. A real product would protect the channel.
+  \item \textbf{Key handling.} Keys travel with every command and are held in kernel memory. A design with keys stored on the device and referenced by handle would be safer.
+  \item \textbf{Algorithms.} Only SHA-1, SHA-256, HMAC-SHA-256 and AES in four modes are offered. Other hashes, other modes and random number generation could be added with the same protocol.
+  \item \textbf{GCM on the board.} Enabling AEAD in the board kernel would remove the software GHASH and allow the board's own GCM engine.
+  \item \textbf{Automated testing without hardware.} Every functional test needs the real board. A mock of the daemon speaking the same protocol over a pipe would allow the suite to run in continuous integration.
+  \item \textbf{Refactoring.} Several functions are long, notably the probe function in the module and the serving loop in the daemon. Splitting them is worth doing when a recoverable board is available for testing.
+\end{itemize}
+
+\chapter{Conclusion}
+
+The project built a working USB device driver for Linux and the device it drives. The module registers real crypto algorithms with the kernel, so existing programs use the board without change. The board daemon turns a small ARM computer into a crypto peripheral, using its hardware engines through the kernel's own interface. The protocol is small, tagged and retransmitting, and the engine keeps several commands in flight. The result passes 690 checks against reference implementations on real hardware, with no errors or retries over tens of thousands of requests.
+
+The work also shows how a driver sits between two worlds. On one side it speaks a hardware protocol, here USB bulk transfers with their packet rules. On the other side it implements a subsystem contract, here the asynchronous crypto API with its priorities, types and completion rules. Most of the effort went into the places where those two worlds disagree: timing, failure, ownership and teardown.
+
+% ====================================================================
+\appendix
+\chapter{Command reference}
+% ====================================================================
+
+\section{Module parameters}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{llXl}
+\toprule
+Name & Default & Meaning & Changeable \\
+\midrule
+\code{prio} & 50 & crypto API priority of all registered algorithms & at load \\
+\code{window} & 4 & commands in flight per board, 1 to 8 & at run time \\
+\code{chunk} & 16384 & bytes per cipher command, multiple of 16, up to 32768 & at run time \\
+\bottomrule
+\end{tabularx}
+\caption{Module parameters of \code{bbcrypto}.}
+\end{table}
+
+\section{Registered algorithms}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{ll}
+\toprule
+Generic name & Driver name \\
+\midrule
+\code{sha1} & \code{sha1-bbcrypto}, \code{sha1-async-bbcrypto} \\
+\code{sha256} & \code{sha256-bbcrypto}, \code{sha256-async-bbcrypto} \\
+\code{hmac(sha256)} & \code{hmac-sha256-bbcrypto}, \code{hmac-sha256-async-bbcrypto} \\
+\code{ecb(aes)} & \code{ecb-aes-bbcrypto} \\
+\code{cbc(aes)} & \code{cbc-aes-bbcrypto} \\
+\code{ctr(aes)} & \code{ctr-aes-bbcrypto} \\
+\code{gcm(aes)} & \code{gcm-aes-bbcrypto} \\
+\bottomrule
+\end{tabular}
+\caption{Algorithms provided by the module.}
+\end{table}
+
+\section{Common commands}
+
+\begin{lstlisting}[style=shell]
+make deploy HOST=user@machine       # build, install, load and test remotely
+make install-board                  # copy daemon and services to the board
+sudo modprobe bbcrypto prio=400     # make plain names use the board
+cat /sys/bus/usb/drivers/bbcrypto/*/stats
+sudo tests/afalg_test               # full functional suite
+sudo tests/afalg_test unplug        # device removal test
+python3 demos/4_priority.py         # who answers a plain sha256 request
+\end{lstlisting}
+
+\chapter{Message sequence of one request}
+
+Figure~\ref{fig:seq} shows one 16 KiB CBC decrypt chunk, including a lost reply and the retry that follows.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \draw[thick] (0,0) -- (0,-7.6); \node[above] at (0,0) {Module (PC)};
+  \draw[thick] (7.5,0) -- (7.5,-7.6); \node[above] at (7.5,0) {Daemon (board)};
+  \draw[arr] (0,-0.8) -- node[lbl,above,sloped]{CIPHER, tag 7} (7.5,-1.2);
+  \node[lbl,anchor=west] at (7.7,-1.2) {run on AES engine};
+  \draw[arr,dashed] (7.5,-2.2) -- node[lbl,above,sloped]{reply tag 7 (lost)} (3.8,-2.55);
+  \node[lbl,anchor=east] at (-0.2,-3.0) {1000 ms, no reply};
+  \draw[arr] (0,-3.4) -- node[lbl,above,sloped]{CIPHER, tag 7 again} (7.5,-3.8);
+  \node[lbl,anchor=west] at (7.7,-3.8) {tag 7 is cached};
+  \node[lbl,anchor=west] at (7.7,-4.15) {no second execution};
+  \draw[arr] (7.5,-4.6) -- node[lbl,above,sloped]{cached reply tag 7} (0,-5.0);
+  \node[lbl,anchor=east] at (-0.2,-5.0) {match tag, finish};
+  \draw[arr] (0,-5.9) -- node[lbl,above,sloped]{next command} (7.5,-6.3);
+\end{tikzpicture}
+\caption{A retransmission. The board answers the repeated tag from its reply cache.}\label{fig:seq}
+\end{figure}
+
+\input{parts/l_end}
+
+\end{document}

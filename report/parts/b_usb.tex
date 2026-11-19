@@ -1,0 +1,90 @@
+\section{Enumeration step by step}
+
+When a device is connected the following happens, and the driver only gets involved at the end.
+
+\begin{enumerate}
+  \item The hub notices a change on a port and reports it to the host.
+  \item The host resets the port, which also tells it the device speed.
+  \item The host reads the first 8 bytes of the device descriptor on endpoint 0 to learn the maximum packet size of the control endpoint, then assigns the device an address.
+  \item The host reads the full device descriptor, then the configuration descriptor with all interface and endpoint descriptors, and the strings.
+  \item The host selects a configuration with a \code{SET\_CONFIGURATION} request.
+  \item The USB core creates a device object for the device and an object for each interface. For each interface the bus tries to find a driver whose id table matches.
+  \item The matching driver's \code{probe} is called.
+\end{enumerate}
+
+On the board side, FunctionFS is where those descriptors originate. The daemon supplies the interface and endpoint descriptors, and the gadget core assembles them into the configuration the host reads. Nothing in the host-side driver needs to know that the other side is Linux.
+
+\section{Matching: devices, interfaces and class codes}
+
+A device descriptor has a class field, and so does each interface descriptor. Standard classes (mass storage, audio, HID, communications) have standard drivers. The value \code{0xff} means \emph{vendor specific}: no standard driver may claim it, and the vendor supplies one. The project's interface is class \code{0xff}, subclass \code{0x5c}, protocol \code{1}. The subclass and protocol numbers are arbitrary and chosen by the project. Matching on all three together with the vendor and product id makes the match very specific.
+
+The board is a \emph{composite} device: one USB device that offers several interfaces, here serial, Ethernet and the project's function. Each interface can have its own driver. The host's CDC drivers take the serial and network interfaces and \code{bbcrypto} takes the vendor specific one, all at once, which is why the board stays reachable over SSH while it works as a crypto accelerator.
+
+\section{Speeds and packet sizes}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lrr}
+\toprule
+Speed & Signalling rate & Bulk max packet \\
+\midrule
+Full speed & 12 Mbit/s & 64 bytes \\
+High speed & 480 Mbit/s & 512 bytes \\
+SuperSpeed & 5 Gbit/s & 1024 bytes \\
+\bottomrule
+\end{tabular}
+\caption{USB speeds and bulk packet sizes.}
+\end{table}
+
+The board's controller is a USB 2.0 controller that can run at high speed, and the daemon writes both a full speed and a high speed descriptor set, with 512 byte bulk packets for the latter. The theoretical ceiling of 480 Mbit/s is 60 MB/s. The measured transport only throughput of the project (Chapter~\ref{ch:test}) is roughly 6.5 MB/s, about a tenth of that, which shows how much slower the board's controller and the daemon path are than the wire.
+
+\section{What a bulk transfer looks like on the wire}
+
+A bulk OUT transfer of $n$ bytes is split by the host controller into packets of the endpoint's maximum size. Each packet is acknowledged by the device. If the device cannot take a packet (no buffer is queued) it answers with a negative acknowledgment (NAK) and the host retries later. This is what the project's protocol relies on for flow control: the host does not need to know whether the daemon is busy.
+
+The \emph{transfer} ends with a packet shorter than the maximum. Table~\ref{tab:bulk} shows lengths and the packets they produce on a high speed link.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{rll}
+\toprule
+Message length & Packets & Ends with \\
+\midrule
+35 & 35 & short packet (ends the transfer) \\
+511 & 511 & short packet \\
+512 & 512 & full packet, \emph{needs} a zero length packet or padding \\
+513 & 512 + 1 & short packet \\
+1024 & 512 + 512 & full packet, same problem \\
+\bottomrule
+\end{tabular}
+\caption{Bulk transfers and the short packet rule at 512 bytes.}\label{tab:bulk}
+\end{table}
+
+A zero length packet is legal USB, but support for it varies between controller drivers. The project avoids depending on it. Whenever a message is an exact multiple of 512 bytes, the sender appends one byte of padding, so the final packet is always short. In the code this is one line in the command builder:
+
+\begin{lstlisting}
+if (c->olen % 512 == 0)
+	c->obuf[c->olen++] = 0; /* force a short final packet */
+\end{lstlisting}
+
+and the corresponding line in the daemon's reply builder, \code{if (len \% 512 == 0) ce->buf[len++] = 0}.
+
+\section{URB status codes}
+
+A completed URB carries a status. The handlers distinguish three kinds.
+
+\begin{description}
+  \item[0] success.
+  \item[\code{-ENOENT}, \code{-ECONNRESET}, \code{-ESHUTDOWN}] the URB was cancelled or the device is gone. These are expected on disconnect. The receive handler returns without resubmitting.
+  \item[anything else] a real transfer error, for example \code{-EPROTO}, \code{-EILSEQ} or \code{-EOVERFLOW}. The receive handler tolerates up to twenty consecutive errors and resubmits the URB, then gives up with a log message. A send error finishes the command with that status.
+\end{description}
+
+\section{Hotplug, udev and automatic loading}
+
+When the USB core finds a new interface it emits a \emph{uevent} with a \code{MODALIAS} string that encodes the ids, for example \code{usb:v1D6Bp0104\ldots ic FF isc 5C ip 01}. The user space daemon \code{udev} passes this to \code{modprobe}, which looks it up in the alias table written by \code{depmod} from every module's \code{MODULE\_DEVICE\_TABLE}. The deployment script installs the module under \code{/lib/modules/\ldots/extra} and runs \code{depmod -a}. From then on, plugging the board in loads and binds the driver without any command.
+
+The same \code{depmod} line is also what a distribution package would do. It is the reason \code{MODULE\_DEVICE\_TABLE} is mandatory for any driver for hot pluggable hardware.
+
+\section{USB and power}
+
+A device can be suspended by the host when idle. The driver does not implement suspend or reset handlers. Disconnect covers removal, and the driver is not used on battery powered hosts in this project. A production driver would add \code{suspend}, \code{resume} and \code{reset\_resume} so that open requests survive a power transition.

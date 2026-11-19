@@ -1,0 +1,43 @@
+\chapter{Security considerations}\label{ch:security}
+
+\section{What is protected and what is not}
+
+A crypto accelerator moves secrets. The project is a driver exercise, and its security properties are limited, and it is useful to state exactly how.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+Asset & Exposure \\
+\midrule
+Keys & travel over the USB cable in clear with every cipher and HMAC command, and appear in the board's memory for the duration of the request \\
+Plaintext and ciphertext & travel in clear over the cable in both directions \\
+Command integrity & no authentication: a device on the cable that speaks the protocol can answer a request \\
+Board identity & the host accepts any USB device with the right ids and interface class \\
+\bottomrule
+\end{tabularx}
+\caption{Exposure of assets.}
+\end{table}
+
+The threat model is physical: anyone who can plug into or tap the USB cable, or who can attach a device that looks like the board, can read and alter the traffic. For a laboratory project this is acceptable. The report states it so no one mistakes the board for a trusted crypto device.
+
+\section{What the code does for safety}
+
+\begin{itemize}
+  \item \textbf{Bounds checks everywhere.} Both sides check every length in a header against its limit and against the number of bytes received before using it. A malformed message cannot make either side read or write out of bounds.
+  \item \textbf{Constant time tag comparison.} The daemon accumulates the xor of all tag bytes and tests the result once, so the time taken does not tell an attacker which byte first differed.
+  \item \textbf{Authentication failure is an error, not output.} A failed GCM check produces no plaintext at all; the daemon returns \code{-EBADMSG} before copying any result.
+  \item \textbf{Keys are not cached.} The board opens a transform per cipher request and closes it afterwards. The host copies the key only into the transform context, which is freed with the transform.
+  \item \textbf{No secrets in scripts.} The deployment script takes the sudo password from an environment variable and passes it to \code{sudo -S} through the shell, so it never appears in the process list. Defaults for the board (an address and a known default password of the image) are overridable and apply only to a direct cable link.
+  \item \textbf{Unsigned module.} The module is not signed. On a system that enforces signatures it will not load, which is the correct behaviour for such a system.
+\end{itemize}
+
+\section{What a production design would add}
+
+\begin{itemize}
+  \item an authenticated and encrypted channel between host and board, for example a key agreed at provisioning, so that traffic and keys are protected on the cable;
+  \item key handles: keys loaded once onto the board and referred to by an id, so they do not travel with every request;
+  \item device authentication, so the host accepts only the intended board;
+  \item zeroing of key buffers on the host side after use, and use of the kernel's key retention services;
+  \item rate limits and resource limits on the board for hash sessions, against a misbehaving host.
+\end{itemize}

@@ -1,0 +1,120 @@
+\section{Building a command}
+
+Every operation starts in \code{bbc\_cmd\_new}. It allocates five things: the command structure, a buffer for the outgoing message, a buffer for the reply, an URB, and takes a reference on the board. If any allocation fails, everything allocated so far is freed and \code{NULL} is returned, so callers have a single failure case to check.
+
+The function then writes the header in little endian with \code{cpu\_to\_le32} and \code{cpu\_to\_le16}, which are no-ops on a little endian PC and a byte swap on a big endian one, followed by the key and IV. It does \emph{not} copy the data. It returns a pointer to where the data belongs, and the caller copies into it from the request's scatterlist. This avoids an intermediate buffer. If the total message length is a multiple of 512, the function appends the pad byte.
+
+A command receives its tag only when it is submitted (\code{bbc\_cmd\_submit}), under the board's lock: \code{c->tag = ++d->tag}. Doing it under the lock makes tags unique and increasing per board even when many threads submit at the same time, and means that a command built but never submitted never uses a tag.
+
+\section{The engine in motion}
+
+Follow one command through the code.
+
+\begin{enumerate}
+  \item \code{bbc\_cmd\_submit} stores the callback, takes a timestamp for the latency statistic, assigns the tag, puts the command on \code{queue}, and calls \code{bbc\_kick} for the pump work. If the board is already dead it completes the command with \code{-ENODEV} instead.
+  \item \code{bbc\_pump\_work} first lets cipher requests emit more chunks (\code{bbc\_emit\_chunks}), then sends queued commands (\code{bbc\_send\_queued}).
+  \item \code{bbc\_send\_queued} loops. Under the lock it checks the window: if the board is dead, or \code{n\_inflight} has reached the window, or the queue is empty, it stops. Otherwise it moves the first command to \code{inflight}, sets its state, resets its attempts to one, records the send time, updates the high-water mark, takes a reference for the URB and arms the timer. It then leaves the lock and submits the URB.
+  \item The output URB completes in \code{bbc\_out\_complete}. If it failed, the command is finished with that status. If it succeeded, the command is marked \code{waiting}, which tells the timer that the reply clock is now running. The URB's reference is dropped.
+  \item The reply arrives on the always-posted receive URB, and \code{bbc\_rx\_complete} finds the command by tag.
+  \item The handler checks the reply is long enough for what its header claims and that it fits in the command's reply buffer, then copies it in and calls \code{bbc\_finish\_locked}, which moves the command to \code{donelist}.
+  \item \code{bbc\_done\_work} runs the callbacks, updates the counters, and finally calls \code{bbc\_emit\_chunks} and \code{bbc\_send\_queued} again because slots have been freed.
+\end{enumerate}
+
+Notice that step 3 sets the timer arm \emph{inside} the lock, with a comment that says why: so that a disconnect, which sets \code{dead} under the same lock, wins the race. Without that, a retransmission timer could be armed on a board that is already being torn down.
+
+\section{Why the receive handler copies}
+
+The handler copies the whole reply into the command's own buffer rather than handing over a pointer to the shared receive buffer. The shared buffer is reused for the next reply as soon as the URB is resubmitted, which happens immediately. A copy of at most 32 KiB per reply is cheap, and it means every command owns its result, so the rest of the driver never has to worry about the buffer being overwritten under it.
+
+\section{Hash sessions on the host}\label{sec:hashhost}
+
+The synchronous hash functions in \code{bbc\_hash\_*} keep a small per-request structure:
+
+\begin{lstlisting}
+struct bbc_hash_desc {   /* per request; id 0 = no board session yet */
+	u32 id;
+	u32 devid;       /* the board that holds the session */
+};
+\end{lstlisting}
+
+\paragraph{Lazy session creation.} \code{init} does nothing on the board. It only zeroes the structure. The session is created on the first \code{update}. This means that a hash which is started and never used costs nothing, and that the common case, a single \code{digest} call, never creates a session at all.
+
+\paragraph{One shot.} \code{final} with no existing session and at most 32 KiB of data uses the \code{ONESHOT} command: one round trip, key and data in, digest out.
+
+\paragraph{Streaming.} \code{update} cuts data into pieces of at most 32 KiB and sends one \code{HASH\_UPDATE} each, in order, waiting for each reply (the calls are synchronous). \code{final} sends \code{HASH\_FINAL} and clears the session id, because the board frees the session on its own.
+
+\paragraph{Export and import.} The crypto API may ask a hash to save its state and later restore it, possibly twice. The state is on the board, so \code{export} asks the board to clone the session and writes two numbers, the \emph{new} session id and the board's id, into the saved state, which is eight bytes in total (\code{statesize = 2 * sizeof(u32)}). \code{import} reads them back. The saved session stays on the board, which means an exported state that is never imported is leaked on the board until the daemon's table evicts it. The code comment in the daemon says so.
+
+\paragraph{Why each call is a synchronous round trip.} The hash interface here is \code{shash}, which has no completion callback. So each \code{bbc\_xfer} sleeps until its reply arrives. Parallelism comes from many callers, each blocked in its own thread, with their commands interleaved in the window. This is the setting demo~5 uses: 64 threads hashing at the same time.
+
+\section{The asynchronous hash state machine}
+
+The \code{ahash} implementation cannot sleep, so each step is a separate command whose completion starts the next. A request carries a stage (\code{AH\_NEW}, \code{AH\_UPD}, \code{AH\_FIN} or \code{AH\_ONE}) and an offset into the data (Figure~\ref{fig:ahstate}).
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=9mm and 14mm]
+  \node[box,fill=blue!8] (s) {start};
+  \node[box,fill=orange!15,right=of s] (new) {AH\_NEW};
+  \node[box,fill=orange!15,right=of new] (upd) {AH\_UPD};
+  \node[box,fill=orange!15,right=of upd] (fin) {AH\_FIN};
+  \node[box,fill=green!14,below=of upd] (one) {AH\_ONE\\(small, final)};
+  \node[box,fill=gray!12,right=of fin] (done) {complete};
+  \draw[arr] (s) -- (new);
+  \draw[arr] (new) -- (upd);
+  \draw[arr] (upd) edge[loop above] node[lbl,above]{more data} (upd);
+  \draw[arr] (upd) -- (fin);
+  \draw[arr] (fin) -- (done);
+  \draw[arr] (s) |- (one);
+  \draw[arr] (one) -| (done);
+\end{tikzpicture}
+\caption{Stages of an asynchronous hash request.}\label{fig:ahstate}
+\end{figure}
+
+\code{bbc\_ah\_step} decides which command to send next from the state (does a session exist, is there data left, is this the final call). \code{bbc\_ah\_done} reads the reply and either calls \code{bbc\_ah\_step} again or completes the request. Because the step function is called from a completion callback, and callbacks run on the workqueue, no recursion builds up on the stack.
+
+The state machine also handles an edge case: an \code{update} of zero bytes with no session, which the crypto layer can issue, finishes at once without touching the board.
+
+\section{Cipher requests: a worked example}
+
+Take an ECB request of 100000 bytes with the default chunk of 16384 and window of 4.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{rrrl}
+\toprule
+Chunk & Offset & Length & Message size on the wire \\
+\midrule
+1 & 0 & 16384 & $32 + 32 + 16384 = 16448$ \\
+2 & 16384 & 16384 & 16448 \\
+3 & 32768 & 16384 & 16448 \\
+4 & 49152 & 16384 & 16448 \\
+5 & 65536 & 16384 & 16448 \\
+6 & 81920 & 16384 & 16448 \\
+7 & 98304 & 1696 & $32 + 32 + 1696 = 1760$ \\
+\bottomrule
+\end{tabular}
+\caption{Chunks of a 100000 byte ECB request with a 256 bit key. ECB has no IV, so only header and key precede the data.}
+\end{table}
+
+Seven commands, with up to four on the wire at once. When one of the first four completes, the engine emits chunk 5 into the freed slot, and so on. For CBC encryption the same request runs the seven chunks \emph{one at a time}, because each chunk needs the chaining value from the reply of the one before it. The field \code{serial} in the request structure is set for exactly that case, and the emit loop's rule \code{it->inflight >= (it->serial ? 1 : win())} enforces it.
+
+\paragraph{Fairness.} If several cipher requests are active, \code{bbc\_emit\_chunks} takes a chunk from the first request that can emit one and then moves that request to the end of the list. The requests thus take turns, and a long request cannot starve a short one that arrived later.
+
+\paragraph{Completion.} Each chunk's callback copies its result into the destination scatterlist at the chunk's offset, decreases the in-flight count, and calls \code{bbc\_creq\_progress}. That function does nothing until nothing is in flight and no chunk is left to emit. Then it removes the request from the active list, writes the final IV back to the request (callers of CBC and CTR expect the IV to be updated), and calls \code{skcipher\_request\_complete}. If any chunk failed, the first error is remembered, no more chunks are emitted, and the error is returned once the chunks already in flight have finished.
+
+\section{Counter arithmetic}
+
+The CTR counter is a 128 bit big endian number. Advancing it by the number of blocks in a chunk is a multiword addition with carry, done byte by byte from the least significant end in \code{bbc\_ctr\_add}. The daemon has a twin of this function (\code{ctr\_add}) so that it can return the incremented counter to the host after a CTR chunk. Both sides agree on the arithmetic, and a test with a 1 MiB CTR request checks that chunk boundaries do not break the stream.
+
+\section{The synchronous helper}
+
+\code{bbc\_xfer} wraps a command in a completion. It builds the command, takes an extra reference for itself, submits with a callback that completes the completion, and sleeps. When woken it first looks at the transport status, then at the board's status in the reply, and then copies the optional IV and data out to the caller's buffers, checking that they fit. Probe uses it for \code{INFO}, and the hash functions use it for everything.
+
+\section{AEAD mapping}
+
+\code{bbc\_aead\_crypt} maps one crypto request to one command. The kernel passes the associated data and the text in the same source scatterlist, and the project's command carries them in one data field, so a single \code{sg\_pcopy\_to\_buffer} of \code{assoclen + cryptlen} bytes is all it needs. The associated data length goes into the header's \code{id} field. On decryption the data field also holds the tag at the end, and the request is rejected beforehand if it is shorter than the tag. The result is copied back with one \code{sg\_pcopy\_from\_buffer}. The 32 KiB limit applies to the sum of the associated data, the text and the tag.
+
+\section{The ping benchmark}
+
+\code{ping\_store} parses two numbers, a size and a count, from what was written to the file. It sends \code{PING} commands through the normal engine, so the window applies, and measures the time with \code{ktime\_get}. It primes the pipeline with twice the window of commands, and each completion callback submits the next one until the count is reached. A guard (an extra pending count) prevents the completion firing before the priming loop is done. The result is a formatted line stored in the board structure and shown when the file is read, with the total time, the time per command and the throughput in KB/s. Section~\ref{sec:transport} shows what it measured.

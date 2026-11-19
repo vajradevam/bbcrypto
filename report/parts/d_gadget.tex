@@ -1,0 +1,38 @@
+\section{The controller on the board}
+
+The AM335x has two USB ports, each served by a MUSB (Mentor) controller. Port 0 is wired as the mini USB connector that the PC connects to, and the Linux driver for it is the MUSB driver in dual role mode with the DSPS glue code (visible as \code{CONFIG\_USB\_MUSB\_DSPS=y} in the board kernel configuration). In device mode the controller is exposed to the gadget framework as a UDC. Its name appears in \code{/sys/class/udc/}, and the scripts read it from there.
+
+This controller is a fixed endpoint design: it has a limited number of endpoints with fixed buffer sizes, and incoming OUT packets land in a FIFO of limited size. The consequence, documented in Chapter~\ref{ch:lessons}, is that a packet that arrives while no request is queued on its endpoint can be dropped.
+
+\section{FunctionFS descriptors and strings}
+
+The daemon writes a blob with three parts to \code{ep0}. A header holds a magic number, a total length and flags saying which descriptor sets follow. Then come the descriptors: a count, then the interface descriptor and the two endpoint descriptors, once for full speed and once for high speed. After the descriptor blob it writes a second blob with the strings: a count of strings and languages, the language id (0x0409, US English), and the string itself. The strings blob is required even if the function offers only one string, and the interface descriptor refers to it with \code{iInterface = 1}.
+
+Only after both writes succeed does FunctionFS accept the gadget being bound. That is why the OpenRC service starts the daemon \emph{before} it writes the controller name into \code{UDC}.
+
+\section{Events on endpoint zero}
+
+After the descriptors are accepted, \code{ep0} becomes a stream of fixed size event records. The daemon cares about four.
+
+\begin{description}
+  \item[\code{FUNCTIONFS\_BIND}/\code{UNBIND}] the gadget was bound to or removed from the controller.
+  \item[\code{FUNCTIONFS\_ENABLE}] the host selected the configuration. The endpoint files may now be opened, and the daemon starts its worker thread.
+  \item[\code{FUNCTIONFS\_DISABLE}] the host deselected the configuration, or the cable was pulled. The daemon cancels the worker and waits for it to finish.
+  \item[\code{FUNCTIONFS\_SETUP}] a control request addressed to the function. The project defines none, so the daemon answers with a stall by trying to move zero bytes the wrong way, which is the FunctionFS idiom for it.
+\end{description}
+
+\section{Bring-up order}
+
+The order of operations on the board matters, and the OpenRC \code{start} function reproduces it exactly.
+
+\begin{enumerate}
+  \item The base gadget exists (serial and Ethernet), created by the \code{usbgadget} service, with its controller bound.
+  \item Unbind the controller. This makes the board disappear from the PC for a moment.
+  \item Create the function directory and link it into the configuration.
+  \item Mount FunctionFS at the mount point.
+  \item Start the daemon, which opens \code{ep0} and writes the descriptors.
+  \item Bind the controller again. The board re-enumerates and now offers three interfaces.
+  \item On the PC, the new interface matches the id table and the driver's \code{probe} runs.
+\end{enumerate}
+
+Tear down is the reverse, and the daemon must stop only after the gadget has been unbound.

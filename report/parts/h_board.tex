@@ -1,0 +1,81 @@
+\section{Startup and the information string}
+
+When the daemon starts it first builds its description. \code{build\_info} reads \code{/proc/crypto}, a text file with blocks of lines for each registered algorithm, and for each of the seven algorithms the project cares about it finds the driver with the highest priority. It writes a line such as \code{bbcryptod: sha256=omap-sha256 cbc(aes)=cbc-aes-omap \ldots} into a 256 byte buffer. This string is returned by \code{INFO} and logged by the host driver at probe time, so an operator can see on the PC which engine will really do the work.
+
+The daemon then opens \code{ep0}, writes the descriptors and strings, and enters the event loop described in Chapter~\ref{ch:board}.
+
+\section{AF\_ALG on the board}
+
+All cryptography on the board goes through one helper, \code{alg\_open}. It creates a socket, binds it to a type and a name, sets the key, optionally sets the tag size, and calls \code{accept} to get the operation socket. It returns the operation socket and, through a pointer, the bound socket. The bound socket is usually closed straight away, since the operation socket keeps the transform alive. Error handling closes whatever was opened and returns a negative \code{errno}, so callers can put the number straight into the reply status.
+
+For ciphers each request opens a fresh transform. That costs a few system calls but avoids any cache of keys on the board. Key material therefore lives on the board only for the length of one request.
+
+\section{Hash sessions}
+
+A hash session is an open operation socket. The daemon keeps 256 slots in a table, each holding the file descriptor and a sequence number. Id 0 is invalid. \code{sess\_add} fills the first free slot and, when the table is full, evicts the one with the lowest sequence number, which is the least recently used. \code{sess\_fd} refreshes the sequence number on each use. This eviction exists so that sessions leaked by a crashed or unplugged host cannot fill the table forever.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+Operation & What the daemon does \\
+\midrule
+\code{HASH\_NEW} & open a hash socket with the key (for HMAC); with \code{ONESHOT}, send the data without \code{MSG\_MORE} and read the digest, close; otherwise store the socket and return its slot as the id \\
+\code{HASH\_UPDATE} & \code{send} the data with \code{MSG\_MORE} on the session's socket \\
+\code{HASH\_FINAL} & \code{send} any remaining data without \code{MSG\_MORE}, then read the digest (up to 64 bytes, the largest digest), free the slot \\
+\code{HASH\_CLONE} & \code{accept} again on the session socket, which duplicates the state, store the new socket and return its slot \\
+\code{HASH\_FREE} & close the socket and free the slot \\
+\bottomrule
+\end{tabularx}
+\caption{Hash operations on the board.}
+\end{table}
+
+\section{Cipher handling details}
+
+\code{do\_cipher} builds a control message with the operation (encrypt or decrypt) and, for modes with an IV, a second control message with the IV. It sends the data with \code{sendmsg} and reads exactly as many bytes back as it sent. After success it computes the IV to return. For CBC that is the last block of the \emph{ciphertext}, which is the output when encrypting and the input when decrypting; for CTR it is the counter advanced by the number of blocks. For ECB nothing is returned. The host uses these values as described in Chapter~\ref{ch:host}.
+
+\section{The receive state machine}
+
+The harvester thread is the most intricate code in the daemon, because it must cope with three things that the USB layer can do to a message: split it into several reads, append a pad byte, or lose its first packet.
+
+\begin{enumerate}
+  \item It waits for completions of the queued reads with \code{io\_getevents} and a 100 ms timeout so that it notices a request to quit.
+  \item For each completed read it first checks whether the previous message ended with a multiple of 512 bytes and a pad byte is therefore expected. A read of exactly one byte at that point is that pad: it is discarded and its buffer is queued again.
+  \item If a message is being assembled and the new read does \emph{not} start with a request header magic, it is the next piece of that message: it is appended to the assembly buffer. When enough bytes have arrived, the message is pushed to the ready queue.
+  \item If a message is being assembled and the new read \emph{does} start with a header, the rest of the old message was lost. The old buffer is discarded and queued again, and the new read starts a fresh message. The host's retry will deliver the lost one again.
+  \item A read that starts with a header, and is long enough to contain the whole message according to the lengths in its header, goes straight to the ready queue. A shorter one starts an assembly.
+  \item Anything else (no magic, impossible lengths) is logged as bad data and dropped.
+\end{enumerate}
+
+Before any buffer is used, the lengths in the header are checked against the maximum message size. A header cannot make the daemon read beyond its buffer.
+
+\section{Invariants between the queues}
+
+Three numbers have to be in the right order for the retransmission guarantee to hold.
+
+\[
+\text{window (at most 8)} \;<\; \text{read slots (12)} \quad\text{and}\quad \text{writer queue (8)} \;<\; \text{reply cache (16)}
+\]
+
+The first inequality says the daemon always has a read queued for the next request even with a full window in flight. The second says that a reply entry is never overwritten for a newer reply while the writer thread is still sending it: the writer can be at most eight replies behind, and the cache keeps sixteen. The daemon's comments state these rules, and the window limit of 8 in the host driver is chosen to respect them.
+
+\section{Reply path}
+
+The reply is assembled directly into a cache slot, so no second copy is needed to keep it for replay. The slot is picked round robin. Its length is set to zero while it is being filled, so a concurrent lookup of the tag does not find a half built entry. When the reply is complete, its tag and length are set, and it is placed on the writer's queue. The queue is bounded by a counting semaphore, so if the writer falls behind, the serving loop waits instead of overwriting.
+
+If a write to the endpoint fails (the host disappeared), the writer sets a flag and wakes the serving loop through a sentinel on the ready queue. The loop then ends, \code{rx\_stop} cancels the writer and the harvester, destroys the AIO context, and the worker closes the endpoint files. The main thread is notified by the \code{DISABLE} event and is ready to start a new worker on the next \code{ENABLE}.
+
+\section{GHASH implementation notes}
+
+\code{ghash\_init} builds a table of sixteen entries, one for each four bit value, holding that value times $H$. It computes the entries for 8, 4, 2 and 1 by repeated halving with reduction (the field's ``multiply by $x$'' step), and fills the rest by xor of those, because multiplication in the field is linear. \code{ghash\_mul} then walks the 16 bytes of the operand from the end, two nibbles per byte, shifting the accumulator right by four bits each step and folding in the bits that fall off using a constant table of sixteen reduction values. The result is written back in big endian order. \code{ghash\_update} xors each 16 byte block into the running value and multiplies, padding the last block with zeros.
+
+The constants and the structure follow the standard table-driven software algorithm for GHASH. The project confirms them the only way that matters: the test suite compares the daemon's tags with those of the kernel's own GCM implementation across many lengths and with forged tags.
+
+\section{Daemon robustness}
+
+\begin{itemize}
+  \item Requests are validated before use: magic, header length, lengths of key, IV and data against their limits, and the sum against the number of bytes actually received.
+  \item Every handler writes a negative \code{errno} into the reply on failure and never exits. An invalid request produces an error reply, never a crash, so one bad message cannot take the service down.
+  \item A message that cannot be parsed and has no valid tag cannot be answered. It is dropped, and the host's timer recovers.
+  \item The worker thread is created and cancelled on \code{ENABLE} and \code{DISABLE}, with a cleanup handler that always runs, so endpoint files and the AIO context are not leaked across reconnects.
+\end{itemize}

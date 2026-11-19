@@ -1,0 +1,90 @@
+\section{Design alternatives that were considered}
+
+Several decisions in the design have an obvious alternative. Table~\ref{tab:alt} records what was chosen and why. The reasoning matters more than the choice, because it shows what the constraints were.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabularx}{\textwidth}{p{2.9cm}p{3.4cm}X}
+\toprule
+Question & Chosen & Reason, and what was rejected \\
+\midrule
+Integration point & kernel crypto API providers & Every program can use the board unchanged. A private character device with its own ioctl interface would have needed a client library and would have been invisible to the kernel's own users. \\
+Board side & user space daemon over FunctionFS & Ordinary C code, cross compiled and debugged with ordinary tools. A second kernel module on the board would have needed a kernel rebuild and re-flash, and the board had no recovery path. \\
+Message framing & one request per bulk transfer & Boundaries are given by USB itself, so no length prefix scanning is needed. A byte stream over a serial style endpoint would have needed its own framing and resynchronisation. \\
+Flow control & window of tagged commands & Overlaps transfer and compute. Stop and wait left both sides idle half of the time (Chapter~\ref{ch:test} measures this). \\
+Loss handling & host timer plus board reply cache & Retransmission is safe because the board never executes a tag twice. Relying on USB's own retry would not cover a daemon that dropped a request it had read. \\
+Ciphers & asynchronous skcipher & Matches how hardware drivers are written and lets many requests share the engine. A synchronous interface would have blocked the caller for the full round trip. \\
+Hashes & synchronous shash and asynchronous ahash & The shash interface is what most in-kernel users call. The ahash interface shows the asynchronous style for hashing. Both use one engine. \\
+GCM on board & assembled from CTR, ECB and software GHASH & The board kernel has no AEAD socket support. Rebuilding it was rejected as too risky. \\
+Key storage & key sent with every command & The board holds no key state, so a reboot or retransmission needs no recovery logic. The cost is that keys cross the cable (Chapter~\ref{ch:security}). \\
+\bottomrule
+\end{tabularx}
+\caption{Design decisions and the alternatives rejected.}\label{tab:alt}
+\end{table}
+
+\section{Failure model}
+
+A design is only as good as the failures it expects. The project assumes the following can happen, and each has a mechanism that deals with it.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+Failure & Detected by & Handled by \\
+\midrule
+Request packet lost on the board & no reply within one second & host resends the same tag, up to four sends \\
+Reply packet lost & same timeout & the board answers the repeat from its reply cache \\
+Duplicate reply arrives & no command with that tag is in flight & ignored \\
+Board answers with an error & status field in the reply & error number returned to the caller \\
+Garbled or unknown message & magic and length checks on both sides & dropped (the host will retry) \\
+Cable pulled & URB completes with a shutdown status; disconnect is called & everything pending is completed with \code{-ENODEV} \\
+No board attached & the board list is empty & new requests return \code{-ENODEV} \\
+Module reloaded while the board stays up & random starting tag & stale cached replies are not matched \\
+Memory allocation fails & \code{NULL} return & \code{-ENOMEM} completes the request \\
+Board daemon stops answering & no reply after all retries & \code{-ETIMEDOUT} \\
+\bottomrule
+\end{tabularx}
+\caption{Failures and their handling.}
+\end{table}
+
+\section{Who owns what}
+
+The responsibilities of the three components are deliberately narrow.
+
+\begin{itemize}
+  \item \textbf{The module} owns the interface to the kernel (algorithms, requests, error codes), the cutting of requests into commands, windowing, matching and retransmission.
+  \item \textbf{The protocol header} owns the format of every message and the limits. Neither side defines a number that the other must guess.
+  \item \textbf{The daemon} owns execution: it maps an operation code to an AF\_ALG call, keeps hash sessions, remembers recent replies, and hides how the board does the work.
+\end{itemize}
+
+Because the module treats the board as a black box that executes tagged commands, the same module would work unchanged with a daemon that used a different engine, as long as it honours the protocol.
+
+\section{Concurrency at a glance}
+
+Figure~\ref{fig:conc} shows the threads and execution contexts in play on each side.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=5mm and 8mm]
+  \node[font=\small\bfseries] at (2.5,4.4) {PC (module)};
+  \node[box,fill=blue!8,minimum width=4.6cm] (callers) at (2.5,3.4) {many callers\\(processes, kernel users)};
+  \node[box,fill=orange!15,minimum width=4.6cm] (wq) at (2.5,1.9) {one ordered workqueue\\pump, done, fail, timeout};
+  \node[box,fill=gray!15,minimum width=4.6cm] (irq) at (2.5,0.4) {URB completion (softirq)\\receive and send complete};
+  \draw[arr] (callers) -- (wq);
+  \draw[arr] (wq) -- (irq);
+  \draw[arr] (irq.east) -- ++(0.5,0) |- (wq.east);
+
+  \node[font=\small\bfseries] at (9.5,4.4) {Board (daemon)};
+  \node[box,fill=blue!8,minimum width=4.6cm] (m) at (9.5,3.4) {main thread\\ep0 events};
+  \node[box,fill=green!18,minimum width=4.6cm] (w) at (9.5,1.9) {worker: serving loop};
+  \node[box,fill=orange!15,minimum width=2.2cm] (h) at (8.2,0.4) {harvester};
+  \node[box,fill=orange!15,minimum width=2.2cm] (wt) at (10.8,0.4) {writer};
+  \draw[arr] (m) -- (w);
+  \draw[arr] (h) -- (w);
+  \draw[arr] (w) -- (wt);
+\end{tikzpicture}
+\caption{Execution contexts on each side.}\label{fig:conc}
+\end{figure}
+
+On the PC, the ordered workqueue means that only one work item runs at a time per module. This removes whole classes of races between, for example, the code that emits new chunks and the code that completes a request. Callers and the URB completion handlers still run concurrently with the workqueue, and the spinlock \code{d->lock} covers them.

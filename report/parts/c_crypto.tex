@@ -1,0 +1,94 @@
+\section{Transforms and requests}
+
+The crypto API separates two objects. A \emph{transform} (\code{tfm}) represents an algorithm instance with its key. A \emph{request} represents one operation. A caller allocates a transform once, sets the key once, and then submits many requests on it.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=7mm and 14mm]
+  \node[box,fill=blue!8] (alloc) {\code{crypto\_alloc\_skcipher}\\\emph{by name}};
+  \node[box,fill=blue!8,right=of alloc] (key) {\code{setkey}};
+  \node[box,fill=orange!15,right=of key] (req) {request alloc,\\\code{set\_crypt}};
+  \node[box,fill=green!14,right=of req] (enc) {\code{encrypt} /\\\code{decrypt}};
+  \node[box,fill=gray!12,below=of enc] (cb) {completion\\callback};
+  \draw[arr] (alloc) -- (key);
+  \draw[arr] (key) -- (req);
+  \draw[arr] (req) -- (enc);
+  \draw[arr] (enc) -- node[lbl,right]{\code{-EINPROGRESS}} (cb);
+\end{tikzpicture}
+\caption{Life of an operation through the crypto API.}
+\end{figure}
+
+The algorithm's \code{init} runs when a transform is created. The project's driver uses it only to set per-transform state sizes. \code{setkey} copies the key into the transform's context. The project stores the key in the context and sends it with every command, because the board keeps no per transform state for ciphers.
+
+\section{Block cipher modes}
+
+AES is a block cipher: it encrypts one 16 byte block under a key. A \emph{mode} says how to encrypt data longer than one block. The project provides four modes because each has a different dependency structure, and the dependency structure determines how well a request can be pipelined.
+
+\paragraph{ECB} encrypts every block independently: $C_i = E_K(P_i)$. Identical plaintext blocks give identical ciphertext blocks, so ECB leaks structure and is not safe for real data. It is included because it is the simplest mode and a useful test: every block is independent, so every chunk is independent.
+
+\paragraph{CBC} chains blocks: $C_i = E_K(P_i \oplus C_{i-1})$ with $C_0 = IV$. Encryption of block $i$ needs the output of block $i-1$, so it is strictly serial. Decryption is $P_i = D_K(C_i) \oplus C_{i-1}$, and every $C_{i-1}$ is part of the \emph{input}, so decryption of different blocks is independent.
+
+\paragraph{CTR} turns the cipher into a stream cipher: $C_i = P_i \oplus E_K(\text{ctr} + i)$. The keystream blocks depend only on the counter, so every block is independent in both directions, and any length (not just a multiple of 16) is allowed.
+
+\paragraph{GCM} is CTR for confidentiality together with GHASH for authentication (Section~\ref{sec:gcmmath}). It returns a tag that proves the data and the associated data were not modified.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+Mode & Encrypt & Decrypt & Length rule \\
+\midrule
+ECB & parallel & parallel & multiple of 16 \\
+CBC & \textbf{serial} & parallel & multiple of 16 \\
+CTR & parallel & parallel & any \\
+GCM & parallel + one hash pass & parallel + one hash pass & any, plus a tag \\
+\bottomrule
+\end{tabularx}
+\caption{Dependency structure of the modes.}
+\end{table}
+
+\section{Hash functions and HMAC}
+
+A hash function maps any input to a fixed size digest: 20 bytes for SHA-1, 32 for SHA-256. It processes the input in blocks of 64 bytes, carrying a running state. That state is what makes streaming possible: a caller can add data piecemeal and ask for the digest at the end, and the crypto API's \code{init}, \code{update}, \code{final} and \code{finup} functions reflect that.
+
+HMAC builds a keyed authentication code from a hash: $\text{HMAC}(K,m) = H((K' \oplus \text{opad}) \,\|\, H((K' \oplus \text{ipad}) \,\|\, m))$, where $K'$ is the key padded or hashed to the block size. On the board, HMAC is a normal AF\_ALG hash socket whose algorithm name is \code{hmac(sha256)} and whose key is set with the same socket option as for ciphers. The host side only forwards the key.
+
+The crypto API also defines \code{export} and \code{import}, which save and restore the running state of a hash. This gave the project a design problem: the state lives on the board, not in the PC's memory. The solution (Section~\ref{sec:hashhost}) saves two numbers, a session id and a board id, after asking the board to \emph{clone} the session.
+
+\section{Hardware and software providers coexisting}
+
+A typical machine has several implementations of the same algorithm registered at once: a portable C one, an assembler one that uses processor instructions (AES-NI on x86, for example), and possibly a hardware engine. Each has a priority. When a caller asks for \code{cbc(aes)} the core picks the one with the highest priority. On the board the AM335x's OMAP crypto drivers register themselves in the same way, with higher priority than the software code, so a request for \code{cbc(aes)} on the board lands on the hardware engine without the daemon asking for it specially. The daemon's startup routine reads \code{/proc/crypto} and reports which driver is the best one for each algorithm, so the host can see what the board really uses.
+
+\section{Synchronous and asynchronous contracts}
+
+The asynchronous contract has a few rules that the project's code follows.
+
+\begin{itemize}
+  \item A request may return \code{-EINPROGRESS}, in which case the callback \emph{will} be called exactly once, later. It may also return \code{-EBUSY} when the driver is backlogged (the project does not use this).
+  \item The request memory belongs to the caller. After the completion callback has been called, the driver must not touch the request any more. In the code this appears as a comment: \code{req (and cr) may be gone after this}, and the completion call is the last statement of the function.
+  \item The driver sets \code{CRYPTO\_ALG\_ASYNC}, so callers that cannot wait for completion know not to select it. The AF\_ALG layer handles asynchronous algorithms by waiting on the caller's behalf.
+  \item Completion may happen in any context. The project always completes from its workqueue, so completion is in process context.
+\end{itemize}
+
+\section{How AF\_ALG behaves in practice}
+
+Several details of the socket interface matter in the project's code.
+
+\begin{itemize}
+  \item The \emph{bind} step names the algorithm, and for the board's own use it names a type (\code{hash}, \code{skcipher}, \code{aead}). The type decides which interface the socket exposes.
+  \item The \emph{accept} step returns the operation socket. A single bound socket can accept several operation sockets, each with independent state but the same key. The daemon uses this for \code{HASH\_CLONE}: accepting again from the session socket creates a second operation that shares the key. For hashing the operation socket also inherits the running state in the implementation, which is what the clone relies on.
+  \item \code{MSG\_MORE} on a send tells a hash socket that more data follows. Without it, the data is final and the digest becomes readable. The daemon uses this for \code{HASH\_UPDATE}.
+  \item For ciphers the operation and IV go in control messages (\code{ALG\_SET\_OP}, \code{ALG\_SET\_IV}). The kernel carries the IV across successive sends on the same operation socket. The test helper uses this to feed large inputs in 64 KiB pieces.
+  \item For GCM the associated data length and tag length are separate control and socket options (\code{ALG\_SET\_AEAD\_ASSOCLEN}, \code{ALG\_SET\_AEAD\_AUTHSIZE}).
+  \item A read buffer larger than the output makes the kernel wait for more input. The demo helper reads exactly the output size for this reason.
+\end{itemize}
+
+\section{GCM mathematics}\label{sec:gcmmath}
+
+GCM operates in the field $GF(2^{128})$ with the reduction polynomial $x^{128}+x^7+x^2+x+1$. Given the hash subkey $H = E_K(0^{128})$, GHASH of a sequence of 16 byte blocks $X_1,\ldots,X_m$ is the running value
+\[
+Y_0 = 0,\qquad Y_i = (Y_{i-1} \oplus X_i)\cdot H .
+\]
+For associated data $A$ and ciphertext $C$ the blocks are $A$ padded to a multiple of 16, then $C$ padded the same way, then one block holding the two bit lengths, $\mathrm{len}(A)\,\|\,\mathrm{len}(C)$ as two 64 bit big endian numbers. The tag is $T = \text{GHASH}_H(A,C) \oplus E_K(J_0)$, where $J_0$ is the pre-counter block, which for a 96 bit IV is $IV\,\|\,0x00000001$. The ciphertext is produced with CTR starting at $\text{inc}_{32}(J_0)$.
+
+The only expensive step for software is the field multiplication. A simple bitwise implementation takes 128 steps per block. The daemon uses the \emph{4 bit table method}: it precomputes the sixteen multiples of $H$ for every four bit value, and then multiplies by processing the operand a nibble at a time, with a small table of reduction terms. It processes one block in 32 table lookups. The code is in \code{ghash\_init} (build the table) and \code{ghash\_mul} (use it).
