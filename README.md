@@ -5,17 +5,9 @@ module on the PC registers SHA, HMAC, AES and GCM with the kernel crypto API. Ea
 over a USB bulk pipe to a daemon on the board, which runs it on the AM335x hardware AES/SHA engines
 and sends the result back.
 
-```
- PC                                                         BeagleBone Black
- ──                                                         ────────────────
- any program (AF_ALG, or in-kernel crypto_alloc_*)
-   ▼
- kernel crypto API
-   ▼
- host/bbcrypto.ko  ── USB bulk OUT: request ──►  board/bbcryptod  (FunctionFS gadget)
-   (does no crypto)  ◄─ USB bulk IN:  reply ───         ▼ AF_ALG on the board
-                                                   omap-aes / omap-sha (hardware)
-```
+![bbcrypto architecture](figures/architecture.png)
+
+The diagram is `figures/architecture.tex` (standalone TikZ, rebuild with `make -C figures`).
 
 Speed is about 2.8 to 6.5 MB/s, far below the PC's own CPU. This is a driver project, not a speedup.
 
@@ -39,6 +31,7 @@ tests/        afalg_test.c, the functional suite (runs against the real board)
 tools/        bbcrypt.c (command line client), board_aes.c (proves the AES engine is hardware)
 demos/        eleven usage examples over AF_ALG, run_all.sh runs the quick ones
 scripts/      deploy-host.sh, deploy-kernel.sh, fetch-sysroot.sh, bbb-net-up.sh, bbb-internet.sh
+figures/      standalone TikZ architecture diagram (tex, png, svg)
 report/       LaTeX report (main.tex, built to main.pdf)
 ```
 
